@@ -9,7 +9,7 @@ key, and `git push/pull/fetch/clone` pick the right key automatically. Keys live
 * One tool for every forge: GitHub, Codeberg (Forgejo/Gitea), GitLab incl. subgroups.
 * No `ssh-keygen`, no agent, no `~/.ssh/config` games: key generation is in-process (ed25519).
 * Fails open: anything unexpected → plain `ssh` runs with your original arguments.
-* Linux only (uses `memfd_create` and `/proc/self/fd`). MSRV: Rust 1.85 (declared; CI runs a 1.85 `cargo check`, local verification was on stable only).
+* Linux only (uses `memfd_create` and `/proc/self/fd`). MSRV: Rust 1.85 (declared; only verified on current stable).
 
 ## Install
 
@@ -77,6 +77,7 @@ public key goes to `key_history`).
 | `host list\|add\|rm <host> [--forge K]` | hosts the wrapper acts on (default `github.com`, `codeberg.org`, `gitlab.com`) |
 | `doctor [--json]` | install, `/etc/gitconfig`, real ssh, perms, `integrity_check`, overrides |
 | `backup <file>` / `restore <file> [--overwrite]` | Argon2id + XChaCha20-Poly1305 encrypted; passphrase via prompt, `NDO4GIT_BACKUP_PASSPHRASE`, or `--passphrase-file` |
+| `update [--check] [--version V] [--force]` | self-update from the latest Codeberg release (see below) |
 | `completions <shell>`, `man` | completion scripts / man page (`scripts/gen-assets.sh`) |
 
 Global: `--host HOST`, `--sudo-user-home` (root running under sudo uses `$SUDO_USER`'s data; for the wrapper set `NDO4GIT_SUDO_USER_HOME=1`).
@@ -87,6 +88,24 @@ Data: `~/.config/ndo4git/` (0700) with `keys.db` and `master.key` (0600). The
 home directory comes from the passwd entry of the effective uid, not `$HOME`
 (falls back to `$HOME` only when there is no passwd entry, e.g. containers).
 Modes are checked and repaired on every start; wrong ownership or symlinks are refused.
+
+## Update
+
+```sh
+ndo4git update --check      # is there a newer release?
+sudo ndo4git update         # replaces the running binary (use sudo if it lives in /usr/local/bin)
+```
+
+`update` asks `https://codeberg.org/api/v1/repos/NDO4ME/git/releases/latest`, downloads the
+`ndo4git-<arch>-linux-musl` asset and its `.sha256`, verifies the checksum, stages the new file
+next to the old one, runs it with `--version` as a smoke test, and only then renames it into
+place (atomic; nothing is changed if any step fails). It refuses releases without a checksum
+asset. Trust model: TLS to codeberg.org plus the published SHA-256; there is no separate signing key.
+`NDO4GIT_RELEASES_API` points it at a mirror. If the binary you updated is not the system-wide
+one, it tells you to run `sudo ndo4git install`.
+
+Publishing a release (maintainers): `scripts/release.sh` builds static binaries and checksums
+into `dist/`; `CODEBERG_TOKEN=… scripts/release.sh --publish` tags and uploads them.
 
 ## Architecture
 
@@ -196,7 +215,7 @@ pre-seed `known_hosts` if first-contact MITM matters.
 
 ## Limitations
 
-* Linux only. aarch64 musl is built via `cross` in CI; it was not run in the authoring environment.
+* Linux only. The aarch64 musl build needs `cross` (or a musl cross compiler); it has not been run on real hardware.
 * Bitbucket and other forges are not special-cased (unknown hosts behave like GitHub Enterprise); the SSH transport works, but the printed settings URL may not exist.
 * Only `ssh-ed25519` can be generated; `import` accepts what the `ssh-key` crate build here supports (ed25519), unencrypted.
 * Hosts are matched literally on the destination given to ssh. A `Host alias` in `~/.ssh/config` (e.g. `git@gh-work:o/r`) is **not** resolved; use real host names (or `insteadOf`).
@@ -215,10 +234,15 @@ MIT, see `LICENSE`.
 
 ```sh
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+cargo audit && cargo deny check                # configs: .cargo/audit.toml, deny.toml
 scripts/gen-assets.sh target/release/ndo4git   # man page + completions → target/assets
 cargo deb -p ndo4git                           # needs cargo-deb; postinst runs `ndo4git install`
+scripts/release.sh                             # static musl binaries + checksums in dist/
 ```
 
+There is no hosted CI configuration in the repository; run the commands above before releasing.
+
 Integration tests (`crates/ndo4git/tests/integration.rs`) run the real binary with a temp
-`XDG_CONFIG_HOME` and a fake `ssh` on `PATH` that records its argv and the key it was handed, and
-one test drives real `git ls-remote` through the wrapper.
+`XDG_CONFIG_HOME` and a fake `ssh` on `PATH` that records its argv and the key it was handed;
+one test drives real `git ls-remote` through the wrapper, one runs the real OpenSSH client to
+check it can load the key, and the update tests run against a local HTTP server.

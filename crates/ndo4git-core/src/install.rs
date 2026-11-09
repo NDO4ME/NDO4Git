@@ -239,7 +239,7 @@ fn tmp_name(dst: &Path) -> PathBuf {
 }
 
 /// Write `data` to `dst` atomically (temp file + rename).
-fn write_atomic(dst: &Path, data: &[u8], mode: u32) -> Result<()> {
+pub fn write_atomic(dst: &Path, data: &[u8], mode: u32) -> Result<()> {
     let tmp = tmp_name(dst);
     let _ = fs::remove_file(&tmp);
     let res = (|| -> std::io::Result<()> {

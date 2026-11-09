@@ -5,6 +5,7 @@ mod cli;
 mod commands;
 mod prompt;
 mod render;
+mod update;
 
 use std::ffi::OsString;
 use std::process::ExitCode;

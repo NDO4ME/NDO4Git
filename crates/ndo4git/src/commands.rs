@@ -79,6 +79,11 @@ pub fn run() -> Result<ExitCode> {
             overwrite,
             passphrase_file,
         } => cmd_restore(sudo, &file, overwrite, passphrase_file.as_deref()),
+        Command::Update {
+            check,
+            version,
+            force,
+        } => crate::update::run(check, version.as_deref(), force),
         Command::Install => {
             for l in Plan::system()?.install()? {
                 println!("{l}");

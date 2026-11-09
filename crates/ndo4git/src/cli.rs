@@ -120,6 +120,18 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<PathBuf>,
     },
+    /// Update ndo4git to the latest release from Codeberg
+    Update {
+        /// Only report whether an update is available
+        #[arg(long)]
+        check: bool,
+        /// Install this version instead of the latest (e.g. 0.2.1)
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+        /// Reinstall even if the version is the same or older
+        #[arg(long)]
+        force: bool,
+    },
     /// Install system-wide (root): binary, git-ndo4git link, /etc/gitconfig
     Install,
     /// Reverse `install` (root); user data is kept unless --purge

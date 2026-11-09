@@ -849,3 +849,223 @@ fn github_codeberg_and_gitlab_work_out_of_the_box() {
         .status
         .success());
 }
+
+// ---------------------------------------------------------------- update
+
+mod update {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+    /// Tiny HTTP server: path -> (status, body). Runs for the life of the test process.
+    fn serve(routes: HashMap<String, (u16, Vec<u8>)>) -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let (code, body) = routes
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or((404, b"not found".to_vec()));
+                let head = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&body);
+            }
+        });
+        port
+    }
+
+    fn arch_asset() -> String {
+        format!("ndo4git-{}-linux-musl", std::env::consts::ARCH)
+    }
+
+    struct Fixture {
+        _dir: TempDir,
+        exe: PathBuf,
+        port: u16,
+        env: Env,
+    }
+
+    /// `tag`: release tag; `reported`: what the new binary prints for --version;
+    /// `sha_ok`/`with_sha`: control the checksum asset.
+    fn fixture(tag: &str, reported: &str, sha_ok: bool, with_sha: bool) -> Fixture {
+        let env = Env::new();
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("ndo4git");
+        fs::copy(BIN, &exe).unwrap();
+        let new_bin = format!("#!/bin/sh\necho 'ndo4git {reported}'\n").into_bytes();
+        let name = arch_asset();
+        let sum = if sha_ok {
+            format!("{:x}", Sha256::digest(&new_bin))
+        } else {
+            "0".repeat(64)
+        };
+        let mut routes = HashMap::new();
+        routes.insert("/dl/bin".to_owned(), (200, new_bin));
+        routes.insert(
+            "/dl/sha".to_owned(),
+            (200, format!("{sum}  {name}\n").into_bytes()),
+        );
+        // bind first and keep the listener: the port must never be released
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut assets = vec![format!(
+            r#"{{"name":"{name}","browser_download_url":"http://127.0.0.1:{port}/dl/bin"}}"#
+        )];
+        if with_sha {
+            assets.push(format!(
+                r#"{{"name":"{name}.sha256","browser_download_url":"http://127.0.0.1:{port}/dl/sha"}}"#
+            ));
+        }
+        let assets = assets.join(",");
+        let json = format!(r#"{{"tag_name":"{tag}","assets":[{assets}]}}"#);
+        routes.insert("/api/latest".to_owned(), (200, json.clone().into_bytes()));
+        routes.insert(format!("/api/tags/{tag}"), (200, json.into_bytes()));
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let (code, body) = routes
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or((404, b"nope".to_vec()));
+                let head = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&body);
+            }
+        });
+        Fixture {
+            _dir: dir,
+            exe,
+            port,
+            env,
+        }
+    }
+
+    impl Fixture {
+        fn update(&self, extra: &[&str]) -> Output {
+            // Freshly copied executables can hit ETXTBSY when another test thread forks
+            // while the copy's write fd is still open; retry briefly.
+            for attempt in 0..50 {
+                let mut c = Command::new(&self.exe);
+                c.env_clear()
+                    .env("XDG_CONFIG_HOME", self.env.cfg.path().join("xdg"))
+                    .env(
+                        "NDO4GIT_RELEASES_API",
+                        format!("http://127.0.0.1:{}/api", self.port),
+                    )
+                    .arg("update")
+                    .args(extra);
+                match c.output() {
+                    Err(e) if e.raw_os_error() == Some(26) && attempt < 49 => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    other => return other.unwrap(),
+                }
+            }
+            unreachable!()
+        }
+        fn is_original(&self) -> bool {
+            fs::read(&self.exe).unwrap() == fs::read(BIN).unwrap()
+        }
+        fn litter(&self) -> usize {
+            fs::read_dir(self.exe.parent().unwrap()).unwrap().count()
+        }
+    }
+
+    #[test]
+    fn up_to_date_and_check() {
+        let f = fixture(&format!("v{CURRENT}"), CURRENT, true, true);
+        let o = f.update(&[]);
+        assert!(o.status.success());
+        assert!(String::from_utf8_lossy(&o.stdout).contains("up to date"));
+        assert!(f.is_original());
+
+        let f = fixture("v99.0.0", "99.0.0", true, true);
+        let o = f.update(&["--check"]);
+        assert!(o.status.success(), "{}", s(&o));
+        assert!(String::from_utf8_lossy(&o.stdout).contains("update available"));
+        assert!(f.is_original());
+    }
+
+    #[test]
+    fn updates_in_place() {
+        let f = fixture("v99.0.0", "99.0.0", true, true);
+        let o = f.update(&[]);
+        assert!(o.status.success(), "{}", s(&o));
+        assert!(String::from_utf8_lossy(&o.stdout).contains(&format!("{CURRENT} -> 99.0.0")));
+        assert!(!f.is_original());
+        assert_eq!(
+            fs::read_to_string(&f.exe).unwrap(),
+            "#!/bin/sh\necho 'ndo4git 99.0.0'\n"
+        );
+        assert_eq!(
+            fs::metadata(&f.exe).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(f.litter(), 1, "no staging files left behind");
+        // explicit version
+        let f = fixture("v99.0.0", "99.0.0", true, true);
+        assert!(f.update(&["--version", "99.0.0"]).status.success());
+        assert!(!f.is_original());
+    }
+
+    #[test]
+    fn refuses_bad_downloads() {
+        // wrong checksum
+        let f = fixture("v99.0.0", "99.0.0", false, true);
+        let o = f.update(&[]);
+        assert!(!o.status.success());
+        assert!(s(&o).contains("checksum mismatch"), "{}", s(&o));
+        assert!(f.is_original());
+        assert_eq!(f.litter(), 1);
+        // no checksum asset
+        let f = fixture("v99.0.0", "99.0.0", true, false);
+        let o = f.update(&[]);
+        assert!(!o.status.success());
+        assert!(s(&o).contains("sha256"), "{}", s(&o));
+        assert!(f.is_original());
+        // binary that does not report the expected version
+        let f = fixture("v99.0.0", "1.0.0", true, true);
+        let o = f.update(&[]);
+        assert!(!o.status.success());
+        assert!(s(&o).contains("self-test"), "{}", s(&o));
+        assert!(f.is_original());
+        assert_eq!(f.litter(), 1);
+    }
+
+    #[test]
+    fn missing_release_is_reported() {
+        let port = serve(HashMap::new());
+        let e = Env::new();
+        let o = e
+            .cmd()
+            .env(
+                "NDO4GIT_RELEASES_API",
+                format!("http://127.0.0.1:{port}/api"),
+            )
+            .arg("update")
+            .output()
+            .unwrap();
+        assert!(!o.status.success());
+        assert!(s(&o).contains("no matching release"), "{}", s(&o));
+    }
+}
