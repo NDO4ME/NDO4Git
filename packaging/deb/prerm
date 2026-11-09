@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+case "$1" in
+  remove|purge) /usr/bin/ndo4git uninstall || true ;;
+esac
+exit 0

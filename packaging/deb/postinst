@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+case "$1" in
+  configure) /usr/bin/ndo4git install || echo "ndo4git: run 'sudo ndo4git install' to finish setup" >&2 ;;
+esac
+exit 0

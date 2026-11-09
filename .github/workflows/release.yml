@@ -1,0 +1,45 @@
+name: Release
+on:
+  push: { tags: ["v*"] }
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, arch: x86_64, deb: amd64 }
+          - { target: aarch64-unknown-linux-musl, arch: aarch64, deb: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - run: cargo install cross cargo-deb --locked
+      - run: cross build --release --locked --target ${{ matrix.target }}
+      - name: Assets (man page, completions) from the x86_64 build
+        if: matrix.arch == 'x86_64'
+        run: scripts/gen-assets.sh target/${{ matrix.target }}/release/ndo4git target/assets
+      - name: Assets for aarch64 (generated with a host build)
+        if: matrix.arch == 'aarch64'
+        run: |
+          cargo build --release --locked
+          scripts/gen-assets.sh target/release/ndo4git target/assets
+      - name: .deb
+        run: cargo deb -p ndo4git --no-build --no-strip --target ${{ matrix.target }} --output ndo4git_${{ matrix.deb }}.deb
+      - name: Package
+        run: |
+          d=ndo4git-${{ github.ref_name }}-${{ matrix.arch }}-linux-musl
+          mkdir "$d"
+          cp target/${{ matrix.target }}/release/ndo4git README.md "$d"/
+          cp -r target/assets "$d"/
+          tar czf "$d.tar.gz" "$d"
+          sha256sum "$d.tar.gz" ndo4git_${{ matrix.deb }}.deb > "$d.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ndo4git-*.tar.gz
+            ndo4git-*.sha256
+            ndo4git_*.deb

@@ -1,0 +1,4 @@
+[advisories]
+# Present in Cargo.lock only as *optional* dependencies of ssh-key (rsa/ecdsa
+# features), which ndo4git does not enable: `cargo tree -i rsa` is empty.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]

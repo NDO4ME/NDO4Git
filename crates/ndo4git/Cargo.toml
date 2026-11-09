@@ -1,0 +1,49 @@
+[package]
+name = "ndo4git"
+description = "Transparent per-repository SSH key selection for git over SSH"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "ndo4git"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+comfy-table.workspace = true
+ndo4git-core.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.deb]
+name = "ndo4git"
+maintainer = "NDO4ME <git@ndo4.me>"
+section = "vcs"
+priority = "optional"
+depends = "openssh-client, git"
+extended-description = "Transparently selects a per-repository SSH key for git over SSH."
+assets = [
+  ["target/release/ndo4git", "usr/bin/ndo4git", "755"],
+  ["../../target/assets/ndo4git.1", "usr/share/man/man1/ndo4git.1", "644"],
+  ["../../target/assets/ndo4git.bash", "usr/share/bash-completion/completions/ndo4git", "644"],
+  ["../../target/assets/_ndo4git", "usr/share/zsh/vendor-completions/_ndo4git", "644"],
+  ["../../target/assets/ndo4git.fish", "usr/share/fish/vendor_completions.d/ndo4git.fish", "644"],
+  ["../../README.md", "usr/share/doc/ndo4git/README.md", "644"],
+]
+maintainer-scripts = "../../packaging/deb"
