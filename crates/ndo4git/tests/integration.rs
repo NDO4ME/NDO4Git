@@ -775,6 +775,91 @@ fn real_openssh_can_load_the_key() {
     assert!(err.contains("type 2"), "{err}");
 }
 
+/// The file-staging path (used on macOS) driven by real OpenSSH: the key is
+/// loadable, lives in a private 0700 directory, and disappears with ssh.
+#[test]
+fn file_staging_works_with_real_openssh_and_cleans_up() {
+    if !Path::new("/usr/bin/ssh").exists() {
+        return;
+    }
+    let e = Env::new();
+    e.ok(&["new", "o/r"]);
+    let run = e.cfg.path().join("run");
+    fs::create_dir_all(&run).unwrap();
+    let o = e
+        .cmd()
+        .env("PATH", "/usr/bin:/bin")
+        .env("XDG_RUNTIME_DIR", &run)
+        .env("NDO4GIT_KEY_STAGING", "file")
+        .arg("ssh-wrapper")
+        .args([
+            "-vv",
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ProxyCommand=true",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "git@github.com",
+            "git-upload-pack 'o/r'",
+        ])
+        .output()
+        .unwrap();
+    let err = s(&o);
+    assert!(!err.contains("not accessible"), "{err}");
+    assert!(err.contains("/ndo4git-") && err.contains("/key-"), "{err}");
+    assert!(err.contains("type 2"), "{err}");
+    let dir = fs::read_dir(&run).unwrap().next().unwrap().unwrap().path();
+    assert_eq!(
+        fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    // the holder notices ssh is gone and removes the file
+    for _ in 0..40 {
+        if fs::read_dir(&dir).unwrap().count() == 0 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!(
+        "staged key file was not removed: {:?}",
+        fs::read_dir(&dir).unwrap().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn hostkey_policy_controls_the_ssh_option() {
+    let e = Env::new();
+    e.ok(&["new", "o/r"]);
+    assert_eq!(e.ok(&["host", "hostkey"]).trim(), "accept-new");
+    let opts = |e: &Env| -> Vec<String> {
+        e.clear_log();
+        assert!(e
+            .wrapper(&["git@github.com", "git-upload-pack 'o/r'"])
+            .status
+            .success());
+        e.argv_lines()[0].clone()
+    };
+    assert!(opts(&e).contains(&"StrictHostKeyChecking=accept-new".to_owned()));
+    assert_eq!(e.ok(&["host", "hostkey", "strict"]).trim(), "strict");
+    let strict = opts(&e);
+    assert!(
+        strict.contains(&"StrictHostKeyChecking=yes".to_owned()),
+        "{strict:?}"
+    );
+    assert!(!strict.iter().any(|a| a.contains("accept-new")));
+    e.ok(&["host", "hostkey", "ask"]);
+    let ask = opts(&e);
+    assert!(
+        !ask.iter().any(|a| a.starts_with("StrictHostKeyChecking")),
+        "{ask:?}"
+    );
+    assert!(ask.contains(&"IdentitiesOnly=yes".to_owned()));
+    assert!(!e.run(&["host", "hostkey", "bogus"]).status.success());
+}
+
 #[test]
 fn github_codeberg_and_gitlab_work_out_of_the_box() {
     let e = Env::new();
@@ -888,7 +973,7 @@ mod update {
     }
 
     fn arch_asset() -> String {
-        format!("ndo4git-{}-linux-musl", std::env::consts::ARCH)
+        format!("ndo4git-{}-linux-musl", std::env::consts::ARCH) // tests run on Linux
     }
 
     struct Fixture {
@@ -896,13 +981,57 @@ mod update {
         exe: PathBuf,
         port: u16,
         env: Env,
+        pubkey: String,
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Sig {
+        Good,
+        Missing,
+        WrongKey,
+        WrongNamespace,
+    }
+
+    /// Generate an ed25519 key with the real `ssh-keygen`; returns (private path, public line).
+    fn gen_key(dir: &Path, name: &str) -> (PathBuf, String) {
+        let key = dir.join(name);
+        let o = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "t", "-f"])
+            .arg(&key)
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        let pubk = fs::read_to_string(dir.join(format!("{name}.pub"))).unwrap();
+        (key, pubk.trim().to_owned())
+    }
+
+    /// Sign `data` exactly like scripts/release.sh does.
+    fn sign_like_release(dir: &Path, key: &Path, ns: &str, data: &[u8]) -> Vec<u8> {
+        let payload = dir.join("payload");
+        let _ = fs::remove_file(dir.join("payload.sig"));
+        fs::write(&payload, data).unwrap();
+        let o = Command::new("ssh-keygen")
+            .args(["-Y", "sign", "-n", ns, "-f"])
+            .arg(key)
+            .arg(&payload)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        fs::read(dir.join("payload.sig")).unwrap()
     }
 
     /// `tag`: release tag; `reported`: what the new binary prints for --version;
     /// `sha_ok`/`with_sha`: control the checksum asset.
     fn fixture(tag: &str, reported: &str, sha_ok: bool, with_sha: bool) -> Fixture {
+        fixture_sig(tag, reported, sha_ok, with_sha, Sig::Good)
+    }
+
+    fn fixture_sig(tag: &str, reported: &str, sha_ok: bool, with_sha: bool, sig: Sig) -> Fixture {
         let env = Env::new();
         let dir = tempfile::tempdir().unwrap();
+        let keys = tempfile::tempdir().unwrap();
+        let (good_key, pubkey) = gen_key(keys.path(), "release");
+        let (other_key, _) = gen_key(keys.path(), "other");
         let exe = dir.path().join("ndo4git");
         fs::copy(BIN, &exe).unwrap();
         let new_bin = format!("#!/bin/sh\necho 'ndo4git {reported}'\n").into_bytes();
@@ -913,7 +1042,28 @@ mod update {
             "0".repeat(64)
         };
         let mut routes = HashMap::new();
+        let signature = match sig {
+            Sig::Missing => None,
+            Sig::Good => Some(sign_like_release(
+                keys.path(),
+                &good_key,
+                "ndo4git-release",
+                &new_bin,
+            )),
+            Sig::WrongKey => Some(sign_like_release(
+                keys.path(),
+                &other_key,
+                "ndo4git-release",
+                &new_bin,
+            )),
+            Sig::WrongNamespace => {
+                Some(sign_like_release(keys.path(), &good_key, "file", &new_bin))
+            }
+        };
         routes.insert("/dl/bin".to_owned(), (200, new_bin));
+        if let Some(sg) = signature {
+            routes.insert("/dl/sig".to_owned(), (200, sg));
+        }
         routes.insert(
             "/dl/sha".to_owned(),
             (200, format!("{sum}  {name}\n").into_bytes()),
@@ -927,6 +1077,11 @@ mod update {
         if with_sha {
             assets.push(format!(
                 r#"{{"name":"{name}.sha256","browser_download_url":"http://127.0.0.1:{port}/dl/sha"}}"#
+            ));
+        }
+        if sig != Sig::Missing {
+            assets.push(format!(
+                r#"{{"name":"{name}.sig","browser_download_url":"http://127.0.0.1:{port}/dl/sig"}}"#
             ));
         }
         let assets = assets.join(",");
@@ -957,6 +1112,7 @@ mod update {
             exe,
             port,
             env,
+            pubkey,
         }
     }
 
@@ -972,6 +1128,7 @@ mod update {
                         "NDO4GIT_RELEASES_API",
                         format!("http://127.0.0.1:{}/api", self.port),
                     )
+                    .env("NDO4GIT_TEST_RELEASE_PUBKEY", &self.pubkey)
                     .arg("update")
                     .args(extra);
                 match c.output() {
@@ -988,6 +1145,23 @@ mod update {
         }
         fn litter(&self) -> usize {
             fs::read_dir(self.exe.parent().unwrap()).unwrap().count()
+        }
+    }
+
+    #[test]
+    fn unsigned_or_wrongly_signed_releases_are_refused() {
+        for (sig, needle) in [
+            (Sig::Missing, "unsigned"),
+            (Sig::WrongKey, "does not match"),
+            (Sig::WrongNamespace, "namespace"),
+        ] {
+            let f = fixture_sig("v99.0.0", "99.0.0", true, true, sig);
+            let o = f.update(&[]);
+            assert!(!o.status.success());
+            let err = String::from_utf8_lossy(&o.stderr).into_owned();
+            assert!(err.contains(needle), "{needle}: {err}");
+            assert!(f.is_original(), "binary must stay untouched");
+            assert_eq!(f.litter(), 1);
         }
     }
 

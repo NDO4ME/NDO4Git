@@ -11,6 +11,7 @@
 //! * [`backup`]  – encrypted export / import of the whole database
 //! * [`install`] – system-wide install / uninstall (root)
 //! * [`doctor`]  – diagnostics
+//! * [`signing`] – release signature verification
 //! * [`paths`], [`util`], [`error`] – plumbing
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -29,6 +30,7 @@ pub mod install;
 pub mod keygen;
 pub mod paths;
 pub mod repo;
+pub mod signing;
 pub mod util;
 pub mod wrapper;
 

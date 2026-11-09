@@ -23,19 +23,56 @@ pub struct Plan {
     /// Extra environment for the `git` subprocess (tests point `GIT_CONFIG_SYSTEM` at a temp file).
     pub git_env: Vec<(String, String)>,
     pub passwd_path: PathBuf,
+    /// False when a package manager owns the binary (e.g. `/usr/bin/ndo4git`
+    /// from the .deb): it is then neither copied nor removed.
+    pub manage_binary: bool,
+    /// An older location whose copies of ndo4git are removed (`/usr/local/bin`
+    /// when the package owns `/usr/bin`).
+    pub legacy_bin_dir: Option<PathBuf>,
+}
+
+/// True for any `…/ndo4git ssh-wrapper` value, whatever the install prefix.
+fn is_ndo4git_wrapper(v: &str) -> bool {
+    v.strip_suffix(" ssh-wrapper")
+        .is_some_and(|p| p.rsplit('/').next() == Some("ndo4git"))
 }
 
 impl Plan {
     /// The real, system-wide plan.
     pub fn system() -> Result<Self> {
+        let source_exe = std::env::current_exe().ctx("locating the running executable")?;
+        // Running from /usr/bin means a package installed us there: use it in place.
+        let packaged =
+            fs::canonicalize(&source_exe).is_ok_and(|p| p == Path::new("/usr/bin/ndo4git"));
         Ok(Self {
-            bin_dir: PathBuf::from("/usr/local/bin"),
+            bin_dir: PathBuf::from(if packaged {
+                "/usr/bin"
+            } else {
+                "/usr/local/bin"
+            }),
             state_dir: PathBuf::from("/etc/ndo4git"),
-            source_exe: std::env::current_exe().ctx("locating the running executable")?,
+            source_exe,
             require_root: true,
             git_env: Vec::new(),
             passwd_path: PathBuf::from("/etc/passwd"),
+            manage_binary: !packaged,
+            legacy_bin_dir: packaged.then(|| PathBuf::from("/usr/local/bin")),
         })
+    }
+
+    /// Remove ndo4git files left in the legacy directory by an older install.
+    fn remove_legacy(&self, log: &mut Vec<String>) -> Result<()> {
+        let Some(dir) = &self.legacy_bin_dir else {
+            return Ok(());
+        };
+        for n in ["git-ndo4git", "ndo4git"] {
+            let p = dir.join(n);
+            if fs::symlink_metadata(&p).is_ok() {
+                fs::remove_file(&p).ctx(format!("removing {}", p.display()))?;
+                log.push(format!("removed old copy {}", p.display()));
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -111,15 +148,22 @@ impl Plan {
     pub fn install(&self) -> Result<Vec<String>> {
         self.check_root()?;
         let mut log = Vec::new();
-        fs::create_dir_all(&self.bin_dir).ctx(format!("creating {}", self.bin_dir.display()))?;
-
-        if atomic_copy(&self.source_exe, &self.bin_path())? {
-            log.push(format!("installed {}", self.bin_path().display()));
+        if self.manage_binary {
+            fs::create_dir_all(&self.bin_dir)
+                .ctx(format!("creating {}", self.bin_dir.display()))?;
+            if atomic_copy(&self.source_exe, &self.bin_path())? {
+                log.push(format!("installed {}", self.bin_path().display()));
+            } else {
+                log.push(format!("{} already up to date", self.bin_path().display()));
+            }
+            if atomic_symlink("ndo4git", &self.link_path())? {
+                log.push(format!("linked {} -> ndo4git", self.link_path().display()));
+            }
         } else {
-            log.push(format!("{} already up to date", self.bin_path().display()));
-        }
-        if atomic_symlink("ndo4git", &self.link_path())? {
-            log.push(format!("linked {} -> ndo4git", self.link_path().display()));
+            log.push(format!(
+                "{} is provided by the package; left as is",
+                self.bin_path().display()
+            ));
         }
 
         let ours = self.ssh_command();
@@ -128,6 +172,11 @@ impl Plan {
             .ctx(format!("creating {}", self.state_dir.display()))?;
         match current {
             Some(v) if v == ours => log.push("system core.sshCommand already set".into()),
+            // an earlier ndo4git install at another prefix: replace, keep the saved original
+            Some(v) if is_ndo4git_wrapper(&v) => {
+                self.config_set(&ours)?;
+                log.push(format!("moved system core.sshCommand {v:?} -> {ours:?}"));
+            }
             Some(prev) => {
                 write_atomic(&self.previous_path(), prev.as_bytes(), 0o644)?;
                 log.push(format!(
@@ -143,6 +192,8 @@ impl Plan {
                 log.push(format!("set system core.sshCommand = {ours:?}"));
             }
         }
+        // only after git points at the new binary is it safe to drop the old one
+        self.remove_legacy(&mut log)?;
         Ok(log)
     }
 
@@ -153,7 +204,7 @@ impl Plan {
         let mut log = Vec::new();
         let ours = self.ssh_command();
         match self.config_get("--system")? {
-            Some(v) if v == ours => {
+            Some(v) if v == ours || is_ndo4git_wrapper(&v) => {
                 if let Ok(prev) = fs::read_to_string(self.previous_path()) {
                     self.config_set(&prev)?;
                     log.push(format!("restored system core.sshCommand = {prev:?}"));
@@ -167,7 +218,12 @@ impl Plan {
             )),
             None => log.push("system core.sshCommand not set".into()),
         }
-        for p in [self.link_path(), self.bin_path(), self.previous_path()] {
+        self.remove_legacy(&mut log)?;
+        let mut files = vec![self.previous_path()];
+        if self.manage_binary {
+            files.extend([self.link_path(), self.bin_path()]);
+        }
+        for p in files {
             if fs::symlink_metadata(&p).is_ok() {
                 fs::remove_file(&p).ctx(format!("removing {}", p.display()))?;
                 log.push(format!("removed {}", p.display()));
@@ -325,7 +381,69 @@ mod tests {
                 ("GIT_CONFIG_NOSYSTEM".into(), "0".into()),
             ],
             passwd_path: t.join("passwd"),
+            manage_binary: true,
+            legacy_bin_dir: None,
         }
+    }
+
+    #[test]
+    fn wrapper_value_detection() {
+        assert!(is_ndo4git_wrapper("/usr/local/bin/ndo4git ssh-wrapper"));
+        assert!(is_ndo4git_wrapper("/usr/bin/ndo4git ssh-wrapper"));
+        assert!(!is_ndo4git_wrapper("ssh -F /etc/custom"));
+        assert!(!is_ndo4git_wrapper("/opt/other-ndo4git ssh-wrapper"));
+        assert!(!is_ndo4git_wrapper("/usr/bin/ndo4git ssh-wrapper --x"));
+    }
+
+    #[test]
+    fn packaged_install_leaves_binary_and_migrates_legacy_copy() {
+        let t = tempfile::tempdir().unwrap();
+        let mut p = plan(t.path());
+        // pretend an older `install` put things into the legacy directory
+        let legacy = t.path().join("legacy");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("ndo4git"), b"old").unwrap();
+        symlink("ndo4git", legacy.join("git-ndo4git")).unwrap();
+        let old = Plan {
+            bin_dir: legacy.clone(),
+            ..p.clone()
+        };
+        fs::write(
+            t.path().join("gitconfig"),
+            "[core]\n\tsshCommand = ssh -F /etc/custom\n",
+        )
+        .unwrap();
+        old.install().unwrap();
+        assert_eq!(
+            old.config_get("--system").unwrap().unwrap(),
+            old.ssh_command()
+        );
+
+        // the package now owns the binary in p.bin_dir
+        fs::create_dir_all(&p.bin_dir).unwrap();
+        fs::write(p.bin_path(), b"pkg").unwrap();
+        p.manage_binary = false;
+        p.legacy_bin_dir = Some(legacy.clone());
+        let log = p.install().unwrap();
+        assert!(
+            log.iter().any(|l| l.contains("provided by the package")),
+            "{log:?}"
+        );
+        assert_eq!(p.config_get("--system").unwrap().unwrap(), p.ssh_command());
+        assert_eq!(fs::read(p.bin_path()).unwrap(), b"pkg");
+        assert!(fs::symlink_metadata(legacy.join("ndo4git")).is_err());
+        assert!(fs::symlink_metadata(legacy.join("git-ndo4git")).is_err());
+        // the user's original value must still be what uninstall restores
+        p.uninstall(false).unwrap();
+        assert_eq!(
+            p.config_get("--system").unwrap().unwrap(),
+            "ssh -F /etc/custom"
+        );
+        assert_eq!(
+            fs::read(p.bin_path()).unwrap(),
+            b"pkg",
+            "package file untouched"
+        );
     }
 
     #[test]

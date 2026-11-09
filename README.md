@@ -9,16 +9,32 @@ key, and `git push/pull/fetch/clone` pick the right key automatically. Keys live
 * One tool for every forge: GitHub, Codeberg (Forgejo/Gitea), GitLab incl. subgroups.
 * No `ssh-keygen`, no agent, no `~/.ssh/config` games: key generation is in-process (ed25519).
 * Fails open: anything unexpected → plain `ssh` runs with your original arguments.
-* Linux only (uses `memfd_create` and `/proc/self/fd`). MSRV: Rust 1.85 (declared; only verified on current stable).
+* Linux (x86_64, aarch64; static musl binary, any distro; `.deb` for every Debian/Ubuntu) and macOS (Apple Silicon and Intel). MSRV: Rust 1.85 (declared; only verified on current stable).
 
 ## Install
 
+Every [release](https://codeberg.org/NDO4ME/git/releases) carries, each with a `.sha256` and a signed `.sig`:
+
+| Platform | Asset |
+|---|---|
+| Debian / Ubuntu (all releases) | `ndo4git_<version>_amd64.deb`, `ndo4git_<version>_arm64.deb` |
+| Any Linux, static | `ndo4git-x86_64-linux-musl`, `ndo4git-aarch64-linux-musl` |
+| macOS | `ndo4git-aarch64-apple-darwin` (Apple Silicon), `ndo4git-x86_64-apple-darwin` (Intel) |
+
 ```sh
-cargo build --release --target x86_64-unknown-linux-musl   # or download a release / .deb
-sudo ./target/x86_64-unknown-linux-musl/release/ndo4git install
+# Debian / Ubuntu: installs /usr/bin/ndo4git and configures git (postinst runs `ndo4git install`)
+sudo apt install ./ndo4git_<version>_amd64.deb
+
+# any Linux / macOS: download the binary for your platform, then
+chmod +x ndo4git-*; sudo ./ndo4git-<arch>-<os> install
 ```
 
-Re-run `sudo ndo4git install` after upgrading to replace the installed binary.
+From source: `cargo build --release --target x86_64-unknown-linux-musl`, then `sudo ./target/…/ndo4git install`.
+The .deb has no library dependencies (the binary is static); it needs `git` and `openssh-client`.
+When ndo4git runs from `/usr/bin` (the .deb) `install` only configures git and retires an older
+`/usr/local/bin` copy; the package keeps owning the binary.
+
+Re-run `sudo ndo4git install` after upgrading a manually installed binary to replace the installed copy.
 
 `install` (root only, idempotent) copies the binary to `/usr/local/bin/ndo4git`
 (temp file + rename, 0755), links `/usr/local/bin/git-ndo4git`, and runs
@@ -97,15 +113,21 @@ sudo ndo4git update         # replaces the running binary (use sudo if it lives 
 ```
 
 `update` asks `https://codeberg.org/api/v1/repos/NDO4ME/git/releases/latest`, downloads the
-`ndo4git-<arch>-linux-musl` asset and its `.sha256`, verifies the checksum, stages the new file
-next to the old one, runs it with `--version` as a smoke test, and only then renames it into
-place (atomic; nothing is changed if any step fails). It refuses releases without a checksum
-asset. Trust model: TLS to codeberg.org plus the published SHA-256; there is no separate signing key.
+asset for this platform (`ndo4git-<arch>-linux-musl` or `ndo4git-<arch>-apple-darwin`) with its
+`.sha256` and `.sig`, verifies both, stages the new file next to the old one, runs it with
+`--version` as a smoke test, and only then renames it into place (atomic; nothing is changed if
+any step fails). Trust model: the SHA-256 catches corruption; the detached **ed25519 signature**
+(`ssh-keygen -Y sign`, namespace `ndo4git-release`) authenticates the release against a public key
+compiled into the binary. An unsigned or wrongly signed asset is never installed, so a hijacked
+Codeberg account or CDN alone cannot ship code; the signing key stays offline with the maintainer.
+.deb users can also `apt install ./new.deb`; `update` replaces `/usr/bin/ndo4git` in place (needs sudo).
 `NDO4GIT_RELEASES_API` points it at a mirror. If the binary you updated is not the system-wide
 one, it tells you to run `sudo ndo4git install`.
 
-Publishing a release (maintainers): `scripts/release.sh` builds static binaries and checksums
-into `dist/`; `CODEBERG_TOKEN=… scripts/release.sh --publish` tags and uploads them.
+Publishing a release (maintainers): `scripts/release.sh` cross-builds (cargo-zigbuild + zig) the four
+binaries, builds both `.deb` files, writes checksums and signs everything with
+`~/.config/ndo4git-release/release_ed25519` into `dist/`; `CODEBERG_TOKEN=… scripts/release.sh --publish`
+then tags and uploads (the token is passed to curl through a private header file, never argv).
 
 ## Architecture
 
@@ -208,21 +230,24 @@ Does **not** protect against: root, or any process running as the same user (it 
 database — an attacker with the whole directory gets the keys, by design: git runs
 non-interactively so there is no passphrase. Mitigations: keep the directory 0700, use
 GitHub **deploy keys** (per repository, ideally read-only), and encrypt your disk.
-`StrictHostKeyChecking=accept-new` trusts a host key on first use (the spec'd behaviour);
-pre-seed `known_hosts` if first-contact MITM matters.
+Server host keys: by default `StrictHostKeyChecking=accept-new` (trust on first use, reject any
+later change). Tighten it with `ndo4git host hostkey strict` (only hosts already in `known_hosts`
+are accepted) or `ask` (ndo4git passes no option; ssh's own default applies). The policy applies to
+managed calls only and is stored in the database.
 
 `unsafe`: none in this workspace (`#![forbid(unsafe_code)]`). `memfd_create`/`execv` go through `nix`'s safe API.
 
 ## Limitations
 
-* Linux only. The aarch64 musl build needs `cross` (or a musl cross compiler); it has not been run on real hardware.
+* The aarch64 Linux and both macOS binaries are cross-compiled and link cleanly (the arm64 macOS one carries an ad-hoc code signature), but they have **not been run on real hardware**; the test suite runs on x86_64 Linux only. On macOS the key is staged in a 0600 file in a private 0700 directory (no `memfd`/`/proc`) for the lifetime of the ssh process instead of an anonymous memory file; that path is exercised on Linux via `NDO4GIT_KEY_STAGING=file`.
+* macOS: `install` runs `git config --system` for the first `git` on `PATH`; Apple's and Homebrew's git read different system files, so run it with the git you actually use (`doctor` shows what is active).
 * Bitbucket and other forges are not special-cased (unknown hosts behave like GitHub Enterprise); the SSH transport works, but the printed settings URL may not exist.
 * Only `ssh-ed25519` can be generated; `import` accepts what the `ssh-key` crate build here supports (ed25519), unencrypted.
 * Hosts are matched literally on the destination given to ssh. A `Host alias` in `~/.ssh/config` (e.g. `git@gh-work:o/r`) is **not** resolved; use real host names (or `insteadOf`).
 * A global/local `core.sshCommand` or `GIT_SSH_COMMAND` overrides the system setting. `doctor` warns about both.
 * OS keyring support is not implemented; the master key is a file.
 * With `core.sshCommand`, git probes the variant with `ssh -G`, costing one extra ssh start per git command; `git config --system ssh.variant ssh` avoids it.
-* The fallback path (no `memfd_create`) unlinks the temp file immediately; the holder's open descriptor keeps it alive. The key is readable through `/proc/<holder pid>/fd` only by the same user (or root).
+* The Linux fallback path (no `memfd_create`) unlinks the temp file immediately; the holder's open descriptor keeps it alive. The key is readable through `/proc/<holder pid>/fd` only by the same user (or root). With file staging (macOS) the file exists on disk (0600, private directory) until ssh exits; a hard-killed holder leaves it behind until the next run sweeps files older than a day.
 * Wrapper `last_used_at` is best effort and rate limited.
 * `cargo-deny`/`cargo audit` configs: two advisories are ignored because they concern optional `ssh-key` features that are not compiled (`cargo tree -i rsa` is empty).
 
@@ -236,8 +261,8 @@ MIT, see `LICENSE`.
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 cargo audit && cargo deny check                # configs: .cargo/audit.toml, deny.toml
 scripts/gen-assets.sh target/release/ndo4git   # man page + completions → target/assets
-cargo deb -p ndo4git                           # needs cargo-deb; postinst runs `ndo4git install`
-scripts/release.sh                             # static musl binaries + checksums in dist/
+scripts/build-deb.sh BINARY amd64|arm64 OUT.deb # needs dpkg-deb; postinst runs `ndo4git install`
+ZIG=… scripts/release.sh                        # 4 binaries + 2 .deb + checksums + signatures in dist/
 ```
 
 There is no hosted CI configuration in the repository; run the commands above before releasing.

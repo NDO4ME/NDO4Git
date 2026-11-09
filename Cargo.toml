@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ndo4git-core", "crates/ndo4git"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -30,7 +30,7 @@ tempfile = "3"
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 thiserror = "2"
 zeroize = { version = "1", features = ["serde"] }
-ndo4git-core = { path = "crates/ndo4git-core", version = "0.2.0" }
+ndo4git-core = { path = "crates/ndo4git-core", version = "0.3.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

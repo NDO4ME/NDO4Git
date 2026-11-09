@@ -1,12 +1,15 @@
 //! `ndo4git update`: self-update from Codeberg releases.
 //!
-//! Flow: query the Forgejo releases API → pick the asset for this CPU →
-//! download it and its `.sha256` → verify → stage next to the running binary →
-//! run the staged binary with `--version` as a smoke test → atomic rename.
+//! Flow: query the Forgejo releases API → pick the asset for this platform →
+//! download it, its `.sha256` and its `.sig` → verify both → stage next to the
+//! running binary → run the staged binary with `--version` as a smoke test →
+//! atomic rename.
 //!
-//! Trust model: TLS to codeberg.org plus a SHA-256 published beside the asset.
-//! This catches corruption and truncated downloads; it does not protect against
-//! a compromised release (there is no separate signing key).
+//! Trust model: the SHA-256 catches corruption; the detached ed25519 signature
+//! (`ssh-keygen -Y sign`, checked against [`RELEASE_PUBKEY`] compiled into the
+//! binary) is what authenticates the release. A compromised download host or
+//! hijacked account cannot ship code without the offline signing key. An
+//! asset without a valid signature is never installed.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -22,6 +25,19 @@ use std::time::Duration;
 const DEFAULT_API: &str = "https://codeberg.org/api/v1/repos/NDO4ME/git/releases";
 const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+/// Public half of the release signing key (private half never leaves the maintainer).
+const RELEASE_PUBKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAL7g6YD63fgksbXMottZcLb0tNtOuhpfNPhLm11gxXK ndo4git-release";
+
+/// The key releases must be signed with. Debug builds (tests only) may
+/// override it; release builds ignore the variable entirely.
+fn trusted_pubkey() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(k) = std::env::var("NDO4GIT_TEST_RELEASE_PUBKEY") {
+        return k;
+    }
+    RELEASE_PUBKEY.to_owned()
+}
 
 #[derive(Deserialize)]
 struct ApiAsset {
@@ -52,24 +68,36 @@ pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     it.next().is_none().then_some(v)
 }
 
-/// Name of the release asset for this CPU.
-pub fn asset_name(arch: &str) -> String {
-    format!("ndo4git-{arch}-linux-musl")
+/// Name of the release asset for this CPU and OS (`linux` / `macos`).
+pub fn asset_name(arch: &str, os: &str) -> String {
+    if os == "macos" {
+        format!("ndo4git-{arch}-apple-darwin")
+    } else {
+        format!("ndo4git-{arch}-linux-musl")
+    }
 }
 
-fn select<'a>(r: &'a ApiRelease, arch: &str) -> Result<(&'a str, Option<&'a str>)> {
-    let want = asset_name(arch);
-    let bin = r
-        .assets
-        .iter()
-        .find(|a| a.name == want)
-        .ok_or_else(|| anyhow!("release {} has no asset named {want}", r.tag_name))?;
-    let sha = r
-        .assets
-        .iter()
-        .find(|a| a.name == format!("{want}.sha256"))
-        .map(|a| a.browser_download_url.as_str());
-    Ok((bin.browser_download_url.as_str(), sha))
+/// Download URLs of an asset and its companions.
+struct Selected<'a> {
+    bin: &'a str,
+    sha: Option<&'a str>,
+    sig: Option<&'a str>,
+}
+
+fn select<'a>(r: &'a ApiRelease, want: &str) -> Result<Selected<'a>> {
+    let find = |n: &str| {
+        r.assets
+            .iter()
+            .find(|a| a.name == n)
+            .map(|a| a.browser_download_url.as_str())
+    };
+    let bin =
+        find(want).ok_or_else(|| anyhow!("release {} has no asset named {want}", r.tag_name))?;
+    Ok(Selected {
+        bin,
+        sha: find(&format!("{want}.sha256")),
+        sig: find(&format!("{want}.sig")),
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -211,18 +239,24 @@ pub fn run(check: bool, version: Option<&str>, force: bool) -> Result<ExitCode> 
         return Ok(ExitCode::SUCCESS);
     }
 
-    let arch = std::env::consts::ARCH;
-    let (bin_url, sha_url) = select(&release, arch)?;
-    let name = asset_name(arch);
-    let sha_url = sha_url.ok_or_else(|| {
+    let name = asset_name(std::env::consts::ARCH, std::env::consts::OS);
+    let sel = select(&release, &name)?;
+    let sha_url = sel.sha.ok_or_else(|| {
         anyhow!("release has no {name}.sha256; refusing to install unverified code")
     })?;
+    let sig_url = sel
+        .sig
+        .ok_or_else(|| anyhow!("release has no {name}.sig; refusing to install unsigned code"))?;
 
     eprintln!("downloading {name} {latest_str} ...");
-    let data = get_bytes(&agent, bin_url, MAX_ASSET_BYTES)?;
+    let data = get_bytes(&agent, sel.bin, MAX_ASSET_BYTES)?;
     let sums = String::from_utf8(get_bytes(&agent, sha_url, 64 * 1024)?)
         .context("checksum file is not UTF-8")?;
     verify_sha256(&data, &sums, &name)?;
+    let sig = String::from_utf8(get_bytes(&agent, sig_url, 64 * 1024)?)
+        .context("signature file is not UTF-8")?;
+    ndo4git_core::signing::verify(&trusted_pubkey(), &data, &sig)
+        .map_err(|e| anyhow!("{name}: {e}; refusing to install"))?;
 
     let exe = std::env::current_exe()
         .and_then(fs::canonicalize)
@@ -281,10 +315,15 @@ mod tests {
                 {"name":"ndo4git-x86_64-linux-musl.sha256","browser_download_url":"https://h/a.sha256"}]}"#,
         )
         .unwrap();
+        let sel = select(&r, &asset_name("x86_64", "linux")).unwrap();
         assert_eq!(
-            select(&r, "x86_64").unwrap(),
-            ("https://h/a", Some("https://h/a.sha256"))
+            (sel.bin, sel.sha, sel.sig),
+            ("https://h/a", Some("https://h/a.sha256"), None)
         );
-        assert!(select(&r, "aarch64").is_err());
+        assert!(select(&r, &asset_name("aarch64", "linux")).is_err());
+        assert_eq!(
+            asset_name("aarch64", "macos"),
+            "ndo4git-aarch64-apple-darwin"
+        );
     }
 }

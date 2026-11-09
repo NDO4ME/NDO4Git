@@ -8,6 +8,7 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 use ndo4git_core::crypto::{record_aad, MasterKey};
 use ndo4git_core::db::{Db, KeyRow, NewKey};
 use ndo4git_core::doctor::{self, Status};
+use ndo4git_core::exec::HostKeyPolicy;
 use ndo4git_core::forge::Forge;
 use ndo4git_core::install::Plan;
 use ndo4git_core::repo::{normalize_host, parse_remote_url, parse_target, DEFAULT_HOST};
@@ -489,6 +490,21 @@ fn cmd_host(sudo: bool, action: HostAction) -> Result<ExitCode> {
             let h = normalize_host(&host)?;
             hosts.retain(|x| *x != h);
             db.set_hosts(&hosts)?;
+        }
+        HostAction::Hostkey { policy } => {
+            if let Some(v) = policy {
+                let p = HostKeyPolicy::parse(&v).ok_or_else(|| {
+                    anyhow::anyhow!("unknown policy {v:?} (accept-new, ask, strict)")
+                })?;
+                db.set_hostkey_policy(p)?;
+                if p == HostKeyPolicy::Strict {
+                    eprintln!(
+                        "strict: only hosts already in known_hosts are accepted; add one first with\n  ssh-keyscan HOST | tee /dev/stderr >> ~/.ssh/known_hosts   (then compare with the forge's published fingerprints)"
+                    );
+                }
+            }
+            println!("{}", db.hostkey_policy()?.name());
+            return Ok(ExitCode::SUCCESS);
         }
     }
     for h in hosts {

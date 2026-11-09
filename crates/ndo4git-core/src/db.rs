@@ -436,6 +436,18 @@ impl Db {
     }
 
     /// Forge software of `host`: explicit override, else guessed from the name.
+    /// Host-key handling for managed calls (meta `hostkey_policy`).
+    pub fn hostkey_policy(&self) -> Result<crate::exec::HostKeyPolicy> {
+        Ok(self
+            .get_meta("hostkey_policy")?
+            .and_then(|v| crate::exec::HostKeyPolicy::parse(&v))
+            .unwrap_or_default())
+    }
+
+    pub fn set_hostkey_policy(&self, p: crate::exec::HostKeyPolicy) -> Result<()> {
+        self.set_meta("hostkey_policy", p.name())
+    }
+
     pub fn forge(&self, host: &str) -> Result<Forge> {
         Ok(self
             .get_meta(&format!("forge:{host}"))?

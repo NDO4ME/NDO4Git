@@ -159,6 +159,8 @@ pub enum HostAction {
     },
     /// Stop managing HOST
     Rm { host: String },
+    /// Show or set how server host keys are checked: accept-new (default), ask or strict
+    Hostkey { policy: Option<String> },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

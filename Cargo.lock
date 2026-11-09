@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "ndo4git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "ndo4git-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",

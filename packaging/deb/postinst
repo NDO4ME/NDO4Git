@@ -1,6 +1,10 @@
 #!/bin/sh
 set -e
 case "$1" in
-  configure) /usr/bin/ndo4git install || echo "ndo4git: run 'sudo ndo4git install' to finish setup" >&2 ;;
+  configure)
+    # points the system gitconfig's core.sshCommand at /usr/bin/ndo4git and
+    # retires any older /usr/local/bin copy; idempotent on upgrades
+    /usr/bin/ndo4git install || echo "ndo4git: run 'sudo ndo4git install' to finish setup" >&2
+    ;;
 esac
 exit 0
