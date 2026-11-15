@@ -463,8 +463,9 @@ mod tests {
         fs::write(
             t.join("passwd"),
             format!(
-                "alice:x:1000:1000::{}:/bin/sh\nroot:x:0:0::/nonexistent:/bin/sh\n",
-                t.join("home/alice").display()
+                "alice:x:{uid}:{uid}::{}:/bin/sh\nroot:x:0:0::/nonexistent:/bin/sh\n",
+                t.join("home/alice").display(),
+                uid = nix::unistd::geteuid().as_raw()
             ),
         )
         .unwrap();
@@ -617,6 +618,27 @@ mod tests {
         p.install().unwrap();
         let log = p.uninstall(true).unwrap();
         assert!(!data.exists(), "{log:?}");
+    }
+
+    #[test]
+    fn purge_skips_a_directory_owned_by_someone_else() {
+        let t = tempfile::tempdir().unwrap();
+        let p = plan(t.path());
+        let data = t.path().join("home/alice/.config/ndo4git");
+        fs::create_dir_all(&data).unwrap();
+        // passwd claims another uid owns this home
+        let other = nix::unistd::geteuid().as_raw() + 1;
+        fs::write(
+            t.path().join("passwd"),
+            format!(
+                "alice:x:{other}:{other}::{}:/bin/sh\n",
+                t.path().join("home/alice").display()
+            ),
+        )
+        .unwrap();
+        p.install().unwrap();
+        p.uninstall(true).unwrap();
+        assert!(data.exists());
     }
 
     #[test]
