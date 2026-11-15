@@ -38,6 +38,7 @@ jobs:
       - name: Cross-build Linux (static musl) and macOS
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
+          SDKROOT: ${{ runner.temp }}
         run: |
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
             cargo zigbuild --release --locked --target "$t"

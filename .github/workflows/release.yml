@@ -60,6 +60,9 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Build all targets
+        env:
+          # zig supplies the macOS libc; an existing, empty SDK path stops rustc probing for xcrun
+          SDKROOT: ${{ runner.temp }}
         # Build, cargo and rustup paths are rewritten so no runner path is baked in.
         run: |
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/src --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME/.rustup=/rustup"
