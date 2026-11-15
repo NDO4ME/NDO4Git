@@ -22,9 +22,15 @@ jobs:
     name: Check and cross-build all targets
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+      - name: Checkout
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY"
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          git -c "http.extraheader=AUTHORIZATION: basic $auth" fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
       - name: Toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy \

@@ -25,14 +25,14 @@
 
 ### CI
 * `.github/workflows/ci.yml`: fmt, clippy and tests and cross-builds all four targets in one job on one Ubuntu 22.04 VM (zig as linker). Tests run on Linux only.
-* `.github/workflows/release.yml`: one job on one VM: tests, four binaries (static musl for Linux x86_64/aarch64, macOS x86_64/aarch64) and two `.deb` packages, version check against `Cargo.toml`, leak check on the binaries, smoke tests on Alpine, Debian, Ubuntu and Fedora, `SHA256SUMS`, attestations and a GitHub release.
+* `.github/workflows/release.yml`: one job on one VM: tests, four binaries (static musl for Linux x86_64/aarch64, macOS x86_64/aarch64) and two `.deb` packages, version check against `Cargo.toml`, leak check on the binaries, smoke tests on Alpine, Debian, Ubuntu and Fedora, `SHA256SUMS` and a GitHub release.
 
 ### Known limitations
 * `--sudo-user-home` ownership checks are not reliable yet; run ndo4git as your own user.
 * macOS and aarch64 are built from the same code but not yet tested on real hardware.
 
 ### Removed
-* `scripts/release.sh` (local cross-build and Codeberg upload): releases are built by the GitHub release workflow, with checksums and build-provenance attestations instead of a local signing key.
+* `scripts/release.sh` (local cross-build and Codeberg upload): releases are built by the GitHub release workflow, with checksums instead of a local signing key.
 * The `write` flag, column and field (deploy-key write access is no longer tracked).
 * `doctor` and `update` (self-update, release-signature verification, the HTTP client).
 * `uninstall` as a public command (kept hidden for the `.deb` removal script).

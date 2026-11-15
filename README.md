@@ -67,8 +67,7 @@ out of a repository it does not manage.
 
 ## Install
 
-Every [release](https://github.com/NDO4ME/NDO4Git/releases) carries these files, a `SHA256SUMS` list and a build-provenance attestation
-(`gh attestation verify FILE --repo NDO4ME/NDO4Git`):
+Every [release](https://github.com/NDO4ME/NDO4Git/releases) carries these files and a `SHA256SUMS` list (`sha256sum -c SHA256SUMS`):
 
 | Platform | Asset |
 |---|---|
@@ -381,7 +380,7 @@ scripts/build-deb.sh BINARY amd64|arm64 OUT.deb # needs dpkg-deb; postinst runs 
 git tag vX.Y.Z && git push origin vX.Y.Z        # release workflow: 4 binaries + 2 .deb + SHA256SUMS
 ```
 
-CI (`.github/workflows/ci.yml`) runs them on one Linux VM and cross-builds Linux (static musl) and macOS binaries for x86_64 and aarch64. Pushing a tag `vX.Y.Z` that matches `Cargo.toml` runs `.github/workflows/release.yml`: one job tests, cross-builds the four binaries and the `.deb` packages from source, writes `SHA256SUMS`, attaches build-provenance attestations and publishes the GitHub release. Release builds contain no runner paths or user names.
+CI (`.github/workflows/ci.yml`) runs them on one Linux VM and cross-builds Linux (static musl) and macOS binaries for x86_64 and aarch64. Pushing a tag `vX.Y.Z` that matches `Cargo.toml` runs `.github/workflows/release.yml`: one job tests, cross-builds the four binaries and the `.deb` packages from source, writes `SHA256SUMS` and publishes the GitHub release. Release builds contain no runner paths or user names.
 
 Integration tests (`crates/ndo4git/tests/integration.rs`) run the real binary with a temp
 `XDG_CONFIG_HOME` and a fake `ssh` on `PATH` that records its argv and the key it was handed;

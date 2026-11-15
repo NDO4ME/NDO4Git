@@ -2,8 +2,8 @@ name: Release
 
 # Push a tag such as v0.4.1 (it must match `version` in Cargo.toml). One job on
 # one Linux VM tests the code, cross-builds the four binaries, packages the
-# .deb files and publishes the GitHub release. Started by hand, it builds and
-# keeps the files as a run artifact but does not publish.
+# .deb files and publishes the GitHub release. Started by hand it only builds
+# and verifies (nothing is published). No third-party actions are used.
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
@@ -27,12 +27,16 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
-      id-token: write
-      attestations: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+      - name: Checkout
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY"
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          git -c "http.extraheader=AUTHORIZATION: basic $auth" fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
 
       - name: Version
         id: v
@@ -117,22 +121,9 @@ jobs:
             echo "* macOS: \`ndo4git-aarch64-apple-darwin\` (Apple Silicon), \`ndo4git-x86_64-apple-darwin\` (Intel)"
             echo "* Debian / Ubuntu: \`ndo4git_${VERSION}_amd64.deb\`, \`ndo4git_${VERSION}_arm64.deb\`"
             echo
-            echo "Verify with \`sha256sum -c SHA256SUMS\` and \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\`."
+            echo "Verify with \`sha256sum -c SHA256SUMS\`."
           } >> notes.md
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-files
-          path: |
-            dist/*
-            notes.md
-          retention-days: 7
-
-      - name: Build provenance
-        if: github.ref_type == 'tag'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/*
 
       - name: Publish release
         if: github.ref_type == 'tag'
