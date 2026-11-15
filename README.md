@@ -1,19 +1,74 @@
 # ndo4git
 
-Transparent **per-repository SSH keys** for `git` over SSH, for **GitHub**,
-**Codeberg / Forgejo / Gitea** and **GitLab** (including nested groups and
-self-hosted instances). Install once, add the generated public key as a deploy
-key, and `git push/pull/fetch/clone` pick the right key automatically. Keys live encrypted in a local SQLite database.
+**One SSH key per repository, picked automatically by `git`.** No `~/.ssh/config` aliases, no
+rewritten remotes, no agent. You clone, pull and push exactly as before; ndo4git works out which
+repository git is talking to and hands ssh that repository's own key.
 
-* Single static binary (`ndo4git`, also reachable as `git ndo4git`).
-* One tool for every forge: GitHub, Codeberg (Forgejo/Gitea), GitLab incl. subgroups.
-* No `ssh-keygen`, no agent, no `~/.ssh/config` games: key generation is in-process (ed25519).
-* Fails open: anything unexpected → plain `ssh` runs with your original arguments.
-* Linux (x86_64, aarch64; static musl binary, any distro; `.deb` for every Debian/Ubuntu) and macOS (Apple Silicon and Intel). MSRV: Rust 1.85 (declared; only verified on current stable).
+Works with **GitHub**, **Codeberg / Forgejo / Gitea** and **GitLab** (nested groups and self-hosted
+instances included). Keys are generated in-process, stored encrypted in a local SQLite database, and
+never written to disk in the clear. Linux and macOS.
+
+```sh
+sudo ndo4git install                  # once per machine
+cd my-clone && ndo4git new            # prints a public key and where to paste it (deploy key page)
+git pull                              # that's it: git now uses a key that only this repo accepts
+```
+
+## Why use it
+
+**The problem.** The usual setup is one personal SSH key that can reach *everything* you can reach.
+That key sits on every laptop, build server and container that needs to clone a private repo.
+If any of them leaks it, every repository (and every organisation) you belong to is exposed.
+
+The safe alternative is a **deploy key per repository**: a key that is only valid for one repo, and
+can be read-only. GitHub even forces this shape: *a deploy key can be added to one repository only*.
+But plain git/ssh makes that painful. You need a `Host` alias and an `IdentityFile` entry per repo in
+`~/.ssh/config`, and you must rewrite every remote to `git@gh-myrepo:owner/repo.git`. Submodules,
+copy-pasted clone URLs, tools that run `git clone git@github.com:owner/repo.git` and CI scripts all
+break, and the key files lie around in `~/.ssh`.
+
+**What ndo4git does about it.** It plugs into git's own `core.sshCommand` hook. On every SSH call it
+reads the repository path git is asking for (`git-upload-pack 'owner/repo.git'`), looks up the key for
+exactly that repo and runs the real `ssh` with it. Remote URLs stay normal. If anything is unknown or
+goes wrong it steps aside and runs plain `ssh` with your original arguments, so it can never lock you
+out of a repository it does not manage.
+
+**Why that is useful**
+
+| You are… | What you get |
+|---|---|
+| a developer with many private repos | one key per repo with zero config; a leaked laptop key exposes one repo, not your whole account |
+| running servers, CI or containers | give each machine its own deploy key (read-only if you tick that box on the forge) for just the repos it needs; rotate one key without touching the rest (`new --rotate`) |
+| working across accounts (work / personal / OSS) | the right commit **identity** (name, e-mail, SSH signing key) is applied per remote automatically, and `whoami` proves git is using it |
+| building tools or letting automation drive git | a single declarative `manifest.toml` with `plan` / `apply` / `rollback`, JSON output on every command and a machine-readable `schema` |
+| security-minded | keys encrypted at rest (XChaCha20-Poly1305), handed to ssh through an anonymous memory file (never argv, env or a named file), no `unsafe` code |
+| performance-minded | the wrapper starts in about 2 ms, nothing runs in the background, and an optional `perf` preset makes everyday git commands a little faster |
+
+**How it compares**
+
+| Approach | Per-repo keys | Normal remote URLs | Works for submodules / CI scripts | Keys encrypted at rest |
+|---|---|---|---|---|
+| one personal key + ssh-agent | no | yes | yes | depends |
+| `~/.ssh/config` host aliases | yes | **no** (remotes rewritten) | **no** | no (plain files) |
+| `core.sshCommand` per clone (`-i key`) | yes | yes | partly (set per repo) | no |
+| **ndo4git** | **yes** | **yes** | **yes** | **yes** |
+
+## What is in the box
+
+* **Transparent per-repo SSH keys** (ed25519 generated in-process; no `ssh-keygen`, no agent).
+* **One tool for every forge**: GitHub, Codeberg (Forgejo/Gitea), GitLab incl. subgroups, plus self-hosted via `host add`.
+* **Fail-open wrapper**: anything unexpected runs plain `ssh` with your original arguments.
+* **Manifest with `plan` / `apply` / `rollback`**: hosts, keys, aliases, git identities and settings from one file, with drift checks for scripts (`plan --check`).
+* **Per-repository git identities** applied by git itself (`includeIf`), optionally with SSH commit signing.
+* **`git` shim**: `install` puts a `git` symlink in front of the real one that just `exec`s it (≈1 ms, no proxy process). `install` refuses to run when git is missing.
+* **Encrypted backup / restore**, key rotation with history, rename aliases, export, import.
+* **Automation friendly**: `--json`, stable exit codes, no prompts, `ndo4git schema`.
+* **Linux and macOS only** (no Windows). Linux: x86_64 and aarch64, static musl binary for any distro, `.deb` for Debian/Ubuntu. macOS: Apple Silicon and Intel. MSRV: Rust 1.85 (declared; only verified on current stable).
 
 ## Install
 
-Every [release](https://codeberg.org/NDO4ME/git/releases) carries, each with a `.sha256` and a signed `.sig`:
+Every [release](https://github.com/NDO4ME/NDO4Git/releases) carries these files, a `SHA256SUMS` list and a build-provenance attestation
+(`gh attestation verify FILE --repo NDO4ME/NDO4Git`):
 
 | Platform | Asset |
 |---|---|
@@ -36,20 +91,29 @@ When ndo4git runs from `/usr/bin` (the .deb) `install` only configures git and r
 
 Re-run `sudo ndo4git install` after upgrading a manually installed binary to replace the installed copy.
 
-`install` (root only, idempotent) copies the binary to `/usr/local/bin/ndo4git`
-(temp file + rename, 0755), links `/usr/local/bin/git-ndo4git`, and runs
+`install` (root only, idempotent) first checks that **git is installed**. If it is not, nothing is
+changed and the command tells you how to install it (`sudo apt install git`, `brew install git`, …).
+Then it copies the binary to `/usr/local/bin/ndo4git` (temp file + rename, 0755), links
+`/usr/local/bin/git-ndo4git` and the **`git` shim** `/usr/local/bin/git`, and runs
 `git config --system core.sshCommand "/usr/local/bin/ndo4git ssh-wrapper"`.
 Any previous system value is saved in `/etc/ndo4git/previous_sshcommand`.
 
-`sudo ndo4git uninstall` reverses all of it and restores the previous value.
-User data is only removed with `--purge`.
+The shim is a symlink to the ndo4git binary. When the binary starts under the name `git` it looks
+the real git up in `PATH` (skipping itself and relative entries) and `exec`s it with the original
+arguments; exit status, stdio and signals are untouched. A `/usr/local/bin/git` that is not ours
+(for example a git built from source) is never replaced or removed. `/usr/local/bin` must come
+before the real git in `PATH`, which is the default on Linux and on Intel macOS; with Homebrew on
+Apple Silicon put it before `/opt/homebrew/bin`. If `PATH` is empty or holds only the shim (cron, IDEs, `env -i`), the shim also tries `/usr/bin`, `/bin` and the Homebrew/Xcode locations, and it stops with a clear error instead of looping when two copies call each other. Key selection itself stays in
+`core.sshCommand`, so programs that call `/usr/bin/git` by absolute path still get the right key.
+
+Removing the `.deb` (`apt remove ndo4git`) restores the previous value automatically; user data is kept.
 
 ## Use
 
 ```sh
 cd my-clone && ndo4git new            # key for origin (any supported host)
-ndo4git new acme/widget --write       # GitHub; remember "write access"
-ndo4git new ssh://git@codeberg.org/NDO4ME/git.git
+ndo4git new acme/widget       # GitHub
+ndo4git new git@github.com:NDO4ME/NDO4Git.git
 ndo4git new git@gitlab.com:group/sub/project.git
 ndo4git new gitlab.example.org/team/proj   # HOST/PATH, after `host add` (see below)
 ```
@@ -61,7 +125,6 @@ Repo:        acme/widget
 Fingerprint: SHA256:...
 Add this public key at:
 https://github.com/acme/widget/settings/keys/new
-(Allow write access: yes)
 
 ssh-ed25519 AAAA... ndo4git:acme/widget@hostname
 ```
@@ -85,18 +148,20 @@ public key goes to `key_history`).
 
 | Command | Purpose |
 |---|---|
-| `new [target] [--rotate] [--write] [--comment S] [--json]` | generate a key (`target`: `OWNER/REPO`, `GROUP/SUB/PROJECT`, `HOST/PATH`, or a clone URL; `--host H` for bare paths) |
+| `new [target] [--rotate] [--comment S] [--json]` | generate a key (`target`: `OWNER/REPO`, `GROUP/SUB/PROJECT`, `HOST/PATH`, or a clone URL; `--host H` for bare paths) |
 | `list [--json]`, `show <repo>`, `rm <repo>` | inspect / delete |
 | `import <repo> <file\|->  [--force]` | store an existing unencrypted OpenSSH key |
+| `init [--force]` | write a starter manifest that reproduces the current state |
+| `plan [--check] [--json]` | show what `apply` would change; `--check` exits 2 on drift |
+| `apply`, `rollback` | reconcile reality with the manifest; undo the last `apply` |
+| `whoami [target]` | which manifest identity applies to a repo, and does git actually use it |
 | `export-pub <repo>`, `export-private <repo> --yes` | the only ways keys leave the DB |
 | `alias <old> <new> [--remove]` | renamed/transferred repo: `old` uses `new`'s key |
 | `host list\|add\|rm <host> [--forge K]` | hosts the wrapper acts on (default `github.com`, `codeberg.org`, `gitlab.com`) |
-| `doctor [--json]` | install, `/etc/gitconfig`, real ssh, perms, `integrity_check`, overrides |
 | `backup <file>` / `restore <file> [--overwrite]` | Argon2id + XChaCha20-Poly1305 encrypted; passphrase via prompt, `NDO4GIT_BACKUP_PASSPHRASE`, or `--passphrase-file` |
-| `update [--check] [--version V] [--force]` | self-update from the latest Codeberg release (see below) |
 | `completions <shell>`, `man` | completion scripts / man page (`scripts/gen-assets.sh`) |
 
-Global: `--host HOST`, `--sudo-user-home` (root running under sudo uses `$SUDO_USER`'s data; for the wrapper set `NDO4GIT_SUDO_USER_HOME=1`).
+Global: `--manifest FILE` (or `NDO4GIT_MANIFEST`), `--host HOST`, `--sudo-user-home` (root running under sudo uses `$SUDO_USER`'s data; for the wrapper set `NDO4GIT_SUDO_USER_HOME=1`).
 
 Environment: `NDO4GIT_DEBUG=1` (wrapper logs to stderr), `NDO4GIT_SSH=/path/to/ssh`, `XDG_CONFIG_HOME`.
 
@@ -105,29 +170,75 @@ home directory comes from the passwd entry of the effective uid, not `$HOME`
 (falls back to `$HOME` only when there is no passwd entry, e.g. containers).
 Modes are checked and repaired on every start; wrong ownership or symlinks are refused.
 
-## Update
+Publishing a release (maintainers): bump `version` in `Cargo.toml`, add a `## X.Y.Z` section to
+`CHANGELOG.md`, commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow does the
+rest (see Development); nothing is built or signed on a personal machine.
 
-```sh
-ndo4git update --check      # is there a newer release?
-sudo ndo4git update         # replaces the running binary (use sudo if it lives in /usr/local/bin)
+## Manifest, plan and apply
+
+`~/.config/ndo4git/manifest.toml` is the single source of truth. Everything else (the database
+rows, generated git config) is derived from it. Start with `ndo4git init`, which writes a manifest
+that matches your current setup, so `ndo4git plan` starts out empty.
+
+```toml
+version = 1
+perf = true             # performance preset, see below
+prune = false           # true: also remove hosts/aliases that are not listed (keys are never deleted)
+hostkey = "accept-new"  # accept-new | ask | strict
+keys = ["acme/widget", "git.example.org/team/proj"]   # must have a key; created by `apply`
+
+[hosts]
+"git.example.org" = "gitlab"       # github | gitlab | forgejo
+
+[aliases]
+"acme/old-name" = "acme/widget"
+
+[settings]                         # allow-listed performance/workflow keys only
+"pull.rebase" = "true"
+
+[[identity]]                       # later entries win, like git's includeIf
+id = "work"
+name = "Ada Lovelace"
+email = "ada@acme.example"
+signing_key = "~/.ssh/id_ed25519.pub"   # optional: sign commits with SSH
+match = ["github.com/acme/*"]
 ```
 
-`update` asks `https://codeberg.org/api/v1/repos/NDO4ME/git/releases/latest`, downloads the
-asset for this platform (`ndo4git-<arch>-linux-musl` or `ndo4git-<arch>-apple-darwin`) with its
-`.sha256` and `.sig`, verifies both, stages the new file next to the old one, runs it with
-`--version` as a smoke test, and only then renames it into place (atomic; nothing is changed if
-any step fails). Trust model: the SHA-256 catches corruption; the detached **ed25519 signature**
-(`ssh-keygen -Y sign`, namespace `ndo4git-release`) authenticates the release against a public key
-compiled into the binary. An unsigned or wrongly signed asset is never installed, so a hijacked
-Codeberg account or CDN alone cannot ship code; the signing key stays offline with the maintainer.
-.deb users can also `apt install ./new.deb`; `update` replaces `/usr/bin/ndo4git` in place (needs sudo).
-`NDO4GIT_RELEASES_API` points it at a mirror. If the binary you updated is not the system-wide
-one, it tells you to run `sudo ndo4git install`.
+```
+$ ndo4git plan
++ host git.example.org (gitlab)
++ key acme/widget on github.com
++ file derived/main.gitconfig
++ ~/.gitconfig include.path = /home/me/.config/ndo4git/derived/main.gitconfig
+4 change(s) pending; run `ndo4git apply`
+```
 
-Publishing a release (maintainers): `scripts/release.sh` cross-builds (cargo-zigbuild + zig) the four
-binaries, builds both `.deb` files, writes checksums and signs everything with
-`~/.config/ndo4git-release/release_ed25519` into `dist/`; `CODEBERG_TOKEN=… scripts/release.sh --publish`
-then tags and uploads (the token is passed to curl through a private header file, never argv).
+* `plan` changes nothing. `plan --check` exits 2 when reality differs (for scripts).
+* `apply` executes the plan in a safe order (the git include is added last and removed first) and
+  prints the public key of every key it created. Every step is journaled in `last-apply.json`;
+  if a step fails the earlier ones stay journaled too.
+* `rollback` undoes the last `apply` (one level). A key created by `apply` is deleted again, unless it has been used since (it is then kept and reported). The journal is validated before anything is undone, and `apply`/`rollback` hold a lock so two runs cannot interleave.
+* Identities are plain git config: `apply` writes `derived/main.gitconfig` with `includeIf
+  "hasconfig:remote.*.url:…"` rules (needs git ≥ 2.36) and adds one `include.path` line to your
+  global gitconfig. Git evaluates them itself, so they cost no process time. Patterns cover
+  `git@host:path`, `ssh://`, `https://` (with or without user and `.git`) and ignore letter case.
+  `ndo4git whoami` shows the identity for the current repository and fails when git uses another.
+* `perf = true` sets: `ssh.variant=ssh` (saves the extra `ssh -G` probe on every git command),
+  `fetch.parallel=0`, `fetch.writeCommitGraph`, `feature.manyFiles`, `pack.threads=0`,
+  `gc.auto=6700`, `maintenance.auto`, `protocol.version=2`, `fetch.negotiationAlgorithm=skipping`.
+  No daemons (no fsmonitor), nothing that grows memory or disk use.
+* The manifest cannot set anything that runs a program (`core.sshCommand`, `core.fsmonitor`,
+  `core.hooksPath`, `alias.*`, `credential.*`, `filter.*`, …): unknown or non-allow-listed keys
+  are rejected, as are control characters in any value.
+
+## Automation and scripting
+
+* `ndo4git schema` prints every command, option, exit code and environment variable as JSON (generated from the real CLI definitions, so it cannot drift).
+* `--json` is available on `new`, `list`, `show`, `plan`, `apply`, `rollback`, `whoami` and `host list`. JSON goes to stdout only; errors and hints go to stderr.
+* Exit status: `0` success, `1` error, `2` key already exists (`new`) or changes pending (`plan --check`).
+* Nothing prompts unless a backup passphrase is needed; `NDO4GIT_BACKUP_PASSPHRASE` or `--passphrase-file` keeps it non-interactive.
+* `plan` is read-only, `apply` is idempotent, `rollback` undoes the last `apply`. Use `--manifest` and `XDG_CONFIG_HOME` to work in an isolated directory.
+* Contributor and tooling notes: [`AGENTS.md`](AGENTS.md).
 
 ## Architecture
 
@@ -141,7 +252,9 @@ crates/
     db.rs + migrations/ rusqlite, WAL, PRAGMA user_version migrations, FK on
     crypto.rs           master key, XChaCha20-Poly1305 records, passphrase blobs
     keygen.rs           ed25519 generate / import (ssh-key crate)
-    backup.rs install.rs doctor.rs paths.rs util.rs error.rs
+    manifest.rs plan.rs  TOML manifest; plan/apply/rollback (pure diff + journal)
+    gitshim.rs          the `git` symlink: find real git, exec it
+    backup.rs install.rs paths.rs util.rs error.rs
   ndo4git/              thin bin: clap CLI, rendering, passphrase prompt
 ```
 
@@ -240,13 +353,16 @@ managed calls only and is stored in the database.
 ## Limitations
 
 * The aarch64 Linux and both macOS binaries are cross-compiled and link cleanly (the arm64 macOS one carries an ad-hoc code signature), but they have **not been run on real hardware**; the test suite runs on x86_64 Linux only. On macOS the key is staged in a 0600 file in a private 0700 directory (no `memfd`/`/proc`) for the lifetime of the ssh process instead of an anonymous memory file; that path is exercised on Linux via `NDO4GIT_KEY_STAGING=file`.
-* macOS: `install` runs `git config --system` for the first `git` on `PATH`; Apple's and Homebrew's git read different system files, so run it with the git you actually use (`doctor` shows what is active).
+* macOS: `install` runs `git config --system` for the first `git` on `PATH`; Apple's and Homebrew's git read different system files, so run it with the git you actually use.
 * Bitbucket and other forges are not special-cased (unknown hosts behave like GitHub Enterprise); the SSH transport works, but the printed settings URL may not exist.
 * Only `ssh-ed25519` can be generated; `import` accepts what the `ssh-key` crate build here supports (ed25519), unencrypted.
 * Hosts are matched literally on the destination given to ssh. A `Host alias` in `~/.ssh/config` (e.g. `git@gh-work:o/r`) is **not** resolved; use real host names (or `insteadOf`).
-* A global/local `core.sshCommand` or `GIT_SSH_COMMAND` overrides the system setting. `doctor` warns about both.
+* A global/local `core.sshCommand` or `GIT_SSH_COMMAND` overrides the system setting.
 * OS keyring support is not implemented; the master key is a file.
-* With `core.sshCommand`, git probes the variant with `ssh -G`, costing one extra ssh start per git command; `git config --system ssh.variant ssh` avoids it.
+* With `core.sshCommand`, git probes the variant with `ssh -G`, costing one extra ssh start per git command; `perf = true` in the manifest (or `git config --system ssh.variant ssh`) avoids it.
+* The `git` shim adds one process start (about 1 ms with a glibc build on a laptop; less with the static musl binary) to every git command. It is a plain `exec`, not a proxy: no extra process stays alive.
+* `includeIf` identities need git ≥ 2.36 (`hasconfig`); `apply` uses `git config --fixed-value` (git ≥ 2.30).
+* Windows is not supported.
 * The Linux fallback path (no `memfd_create`) unlinks the temp file immediately; the holder's open descriptor keeps it alive. The key is readable through `/proc/<holder pid>/fd` only by the same user (or root). With file staging (macOS) the file exists on disk (0600, private directory) until ssh exits; a hard-killed holder leaves it behind until the next run sweeps files older than a day.
 * Wrapper `last_used_at` is best effort and rate limited.
 * `cargo-deny`/`cargo audit` configs: two advisories are ignored because they concern optional `ssh-key` features that are not compiled (`cargo tree -i rsa` is empty).
@@ -262,12 +378,12 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 cargo audit && cargo deny check                # configs: .cargo/audit.toml, deny.toml
 scripts/gen-assets.sh target/release/ndo4git   # man page + completions → target/assets
 scripts/build-deb.sh BINARY amd64|arm64 OUT.deb # needs dpkg-deb; postinst runs `ndo4git install`
-ZIG=… scripts/release.sh                        # 4 binaries + 2 .deb + checksums + signatures in dist/
+git tag vX.Y.Z && git push origin vX.Y.Z        # release workflow: 4 binaries + 2 .deb + SHA256SUMS
 ```
 
-There is no hosted CI configuration in the repository; run the commands above before releasing.
+CI (`.github/workflows/ci.yml`) runs them on one Linux VM and cross-builds Linux (static musl) and macOS binaries for x86_64 and aarch64. Pushing a tag `vX.Y.Z` that matches `Cargo.toml` runs `.github/workflows/release.yml`: one job tests, cross-builds the four binaries and the `.deb` packages from source, writes `SHA256SUMS`, attaches build-provenance attestations and publishes the GitHub release. Release builds contain no runner paths or user names.
 
 Integration tests (`crates/ndo4git/tests/integration.rs`) run the real binary with a temp
 `XDG_CONFIG_HOME` and a fake `ssh` on `PATH` that records its argv and the key it was handed;
 one test drives real `git ls-remote` through the wrapper, one runs the real OpenSSH client to
-check it can load the key, and the update tests run against a local HTTP server.
+check it can load the key.

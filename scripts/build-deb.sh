@@ -38,7 +38,7 @@ chmod 0644 "$P"/usr/share/man/man1/* "$P"/usr/share/bash-completion/completions/
 cat > "$P/usr/share/doc/ndo4git/copyright" <<COPY
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: ndo4git
-Source: https://codeberg.org/NDO4ME/git
+Source: https://github.com/NDO4ME/NDO4Git
 
 Files: *
 Copyright: NDO4ME
@@ -61,7 +61,7 @@ Architecture: $ARCH
 Maintainer: NDO4ME <git@ndo4.me>
 Installed-Size: $SIZE
 Depends: git, openssh-client
-Homepage: https://codeberg.org/NDO4ME/git
+Homepage: https://github.com/NDO4ME/NDO4Git
 Description: transparent per-repository SSH keys for git
  ndo4git picks a dedicated SSH key per repository whenever git talks to
  GitHub, Codeberg (Forgejo) or GitLab over SSH. Keys are generated locally,

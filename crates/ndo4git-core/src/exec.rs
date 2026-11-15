@@ -147,6 +147,10 @@ pub fn managed_prefix(key_path: &str, policy: HostKeyPolicy) -> Vec<OsString> {
         "IdentitiesOnly=yes",
         "-o",
         "IdentityAgent=none",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
     ];
     if let Some(o) = policy.ssh_option() {
         v.extend(["-o", o]);
@@ -396,15 +400,17 @@ fn to_cstring(s: &std::ffi::OsStr) -> Result<CString> {
 
 /// `execv` the given program; only returns on failure.
 fn exec_program(program: &Path, argv: &[OsString]) -> Error {
-    let run = || -> Result<()> {
-        let prog = to_cstring(program.as_os_str())?;
-        let cargv: Vec<CString> = argv.iter().map(|a| to_cstring(a)).collect::<Result<_>>()?;
-        nix::unistd::execv(&prog, &cargv)?;
-        Ok(())
+    let prog = match to_cstring(program.as_os_str()) {
+        Ok(p) => p,
+        Err(e) => return e,
     };
-    match run() {
-        Ok(()) => Error::Invalid("exec returned unexpectedly".into()),
-        Err(e) => e,
+    let cargv: Vec<CString> = match argv.iter().map(|a| to_cstring(a)).collect() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match nix::unistd::execv(&prog, &cargv) {
+        Ok(never) => match never {},
+        Err(errno) => errno.into(),
     }
 }
 
@@ -541,6 +547,10 @@ mod tests {
                 "IdentitiesOnly=yes",
                 "-o",
                 "IdentityAgent=none",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "-p",

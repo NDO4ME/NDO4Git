@@ -12,6 +12,8 @@ use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::gitshim;
+
 const KEY: &str = "core.sshCommand";
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,11 @@ pub struct Plan {
     /// An older location whose copies of ndo4git are removed (`/usr/local/bin`
     /// when the package owns `/usr/bin`).
     pub legacy_bin_dir: Option<PathBuf>,
+    /// Directory that receives the `git` shim symlink; it must come before the
+    /// real git in `PATH` (`/usr/local/bin` does on Linux and macOS).
+    pub shim_dir: PathBuf,
+    /// `PATH` used to look for git (`None`: the process environment).
+    pub search_path: Option<OsString>,
 }
 
 /// True for any `…/ndo4git ssh-wrapper` value, whatever the install prefix.
@@ -57,6 +64,8 @@ impl Plan {
             passwd_path: PathBuf::from("/etc/passwd"),
             manage_binary: !packaged,
             legacy_bin_dir: packaged.then(|| PathBuf::from("/usr/local/bin")),
+            shim_dir: PathBuf::from("/usr/local/bin"),
+            search_path: None,
         })
     }
 
@@ -83,6 +92,63 @@ impl Plan {
     #[must_use]
     pub fn link_path(&self) -> PathBuf {
         self.bin_dir.join("git-ndo4git")
+    }
+
+    #[must_use]
+    pub fn shim_path(&self) -> PathBuf {
+        self.shim_dir.join("git")
+    }
+
+    /// The real git, or an error that says how to install it.
+    fn require_git(&self) -> Result<PathBuf> {
+        let found = match &self.search_path {
+            Some(p) => gitshim::find_real_git(p, Some(&self.source_exe)),
+            None => gitshim::find_real_git_or_fallback(
+                &std::env::var_os("PATH").unwrap_or_default(),
+                Some(&self.source_exe),
+            ),
+        };
+        found.ok_or_else(|| {
+            Error::Invalid(format!(
+                "git is not installed, so ndo4git cannot be set up. Install git first ({}), then run this command again.",
+                gitshim::install_hint()
+            ))
+        })
+    }
+
+    /// Create or refresh the `git` shim, never touching a `git` that is not ours.
+    fn install_shim(&self, log: &mut Vec<String>) -> Result<()> {
+        let dst = self.shim_path();
+        let target = self.bin_path();
+        match fs::symlink_metadata(&dst) {
+            Ok(m) if m.file_type().is_symlink() && link_is_ours(&dst) => {}
+            Ok(_) => {
+                log.push(format!(
+                    "{} exists and is not ours; the git shim was not installed",
+                    dst.display()
+                ));
+                return Ok(());
+            }
+            Err(_) => {}
+        }
+        fs::create_dir_all(&self.shim_dir).ctx(format!("creating {}", self.shim_dir.display()))?;
+        if atomic_symlink(&target.to_string_lossy(), &dst)? {
+            log.push(format!("linked {} -> {}", dst.display(), target.display()));
+        } else {
+            log.push(format!("git shim {} already in place", dst.display()));
+        }
+        Ok(())
+    }
+
+    fn remove_shim(&self, log: &mut Vec<String>) -> Result<()> {
+        let dst = self.shim_path();
+        if fs::symlink_metadata(&dst).is_ok_and(|m| m.file_type().is_symlink())
+            && link_is_ours(&dst)
+        {
+            fs::remove_file(&dst).ctx(format!("removing {}", dst.display()))?;
+            log.push(format!("removed {}", dst.display()));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -147,6 +213,7 @@ impl Plan {
     /// Install (idempotent). Returns log lines describing what was done.
     pub fn install(&self) -> Result<Vec<String>> {
         self.check_root()?;
+        self.require_git()?; // before anything is changed
         let mut log = Vec::new();
         if self.manage_binary {
             fs::create_dir_all(&self.bin_dir)
@@ -194,6 +261,7 @@ impl Plan {
         }
         // only after git points at the new binary is it safe to drop the old one
         self.remove_legacy(&mut log)?;
+        self.install_shim(&mut log)?;
         Ok(log)
     }
 
@@ -219,6 +287,7 @@ impl Plan {
             None => log.push("system core.sshCommand not set".into()),
         }
         self.remove_legacy(&mut log)?;
+        self.remove_shim(&mut log)?;
         let mut files = vec![self.previous_path()];
         if self.manage_binary {
             files.extend([self.link_path(), self.bin_path()]);
@@ -251,13 +320,27 @@ impl Plan {
             .ctx(format!("reading {}", self.passwd_path.display()))?;
         let mut out: Vec<PathBuf> = Vec::new();
         for line in text.lines() {
-            let home = line.split(':').nth(5).unwrap_or("");
+            let mut f = line.split(':');
+            let uid: Option<u32> = f.nth(2).and_then(|u| u.parse().ok());
+            let home = f.nth(2).unwrap_or("");
             if !home.starts_with('/') || home == "/" {
                 continue;
             }
             let d = Path::new(home).join(".config").join("ndo4git");
-            let is_real_dir = fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir());
-            if is_real_dir && !out.contains(&d) {
+            // Purge runs as root: only a real directory, owned by this very
+            // user, reached without any symlinked component.
+            let safe = match (
+                fs::symlink_metadata(&d),
+                fs::canonicalize(&d),
+                fs::canonicalize(home),
+            ) {
+                (Ok(m), Ok(real), Ok(h)) => {
+                    use std::os::unix::fs::MetadataExt;
+                    m.is_dir() && Some(m.uid()) == uid && real == h.join(".config").join("ndo4git")
+                }
+                _ => false,
+            };
+            if safe && !out.contains(&d) {
                 out.push(d);
             }
         }
@@ -284,6 +367,14 @@ pub fn git_config_get(scope: &str, env: &[(String, String)]) -> Result<Option<St
             String::from_utf8_lossy(&o.stderr).trim()
         ))),
     }
+}
+
+/// A symlink whose target is a file named `ndo4git`.
+fn link_is_ours(p: &Path) -> bool {
+    fs::read_link(p)
+        .ok()
+        .and_then(|t| t.file_name().map(|n| n == "ndo4git"))
+        .unwrap_or(false)
 }
 
 fn tmp_name(dst: &Path) -> PathBuf {
@@ -356,6 +447,15 @@ fn atomic_symlink(target: &str, link: &Path) -> Result<bool> {
 mod tests {
     use super::*;
 
+    /// A `PATH` containing a fake, executable `git` (the tests need one that is not ours).
+    fn realgit(t: &Path) -> OsString {
+        let d = t.join("realgit");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("git"), b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(d.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+        d.into_os_string()
+    }
+
     fn plan(t: &Path) -> Plan {
         // a fake "binary" to install
         let src = t.join("src-bin");
@@ -383,6 +483,8 @@ mod tests {
             passwd_path: t.join("passwd"),
             manage_binary: true,
             legacy_bin_dir: None,
+            shim_dir: t.join("shim"),
+            search_path: Some(realgit(t)),
         }
     }
 
@@ -527,5 +629,50 @@ mod tests {
             assert!(e.contains("must be run as root"), "{e}");
             assert!(p.uninstall(false).is_err());
         }
+    }
+
+    #[test]
+    fn install_links_git_shim_and_uninstall_removes_it() {
+        let t = tempfile::tempdir().unwrap();
+        let p = plan(t.path());
+        let log = p.install().unwrap();
+        assert!(log.iter().any(|l| l.contains("git")), "{log:?}");
+        assert_eq!(fs::read_link(p.shim_path()).unwrap(), p.bin_path());
+        // idempotent
+        p.install().unwrap();
+        assert_eq!(fs::read_link(p.shim_path()).unwrap(), p.bin_path());
+        p.uninstall(false).unwrap();
+        assert!(fs::symlink_metadata(p.shim_path()).is_err());
+    }
+
+    #[test]
+    fn foreign_git_is_never_replaced_or_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let p = plan(t.path());
+        fs::create_dir_all(&p.shim_dir).unwrap();
+        fs::write(p.shim_path(), b"real git built from source").unwrap();
+        let log = p.install().unwrap();
+        assert!(log.iter().any(|l| l.contains("not ours")), "{log:?}");
+        assert_eq!(
+            fs::read(p.shim_path()).unwrap(),
+            b"real git built from source"
+        );
+        p.uninstall(false).unwrap();
+        assert_eq!(
+            fs::read(p.shim_path()).unwrap(),
+            b"real git built from source"
+        );
+    }
+
+    #[test]
+    fn install_without_git_changes_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let mut p = plan(t.path());
+        p.search_path = Some(t.path().join("empty").into_os_string());
+        let e = p.install().unwrap_err().to_string();
+        assert!(e.contains("git is not installed"), "{e}");
+        assert!(!p.bin_dir.exists());
+        assert!(!p.shim_dir.exists());
+        assert!(p.config_get("--system").unwrap().is_none());
     }
 }

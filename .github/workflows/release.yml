@@ -1,0 +1,144 @@
+name: Release
+
+# Push a tag such as v0.4.1 (it must match `version` in Cargo.toml). One job on
+# one Linux VM tests the code, cross-builds the four binaries, packages the
+# .deb files and publishes the GitHub release. Started by hand, it builds and
+# keeps the files as a run artifact but does not publish.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Version
+        id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          [ -n "$version" ] || { echo "no version in Cargo.toml" >&2; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2; exit 1
+          fi
+          pre=false; case "$version" in *-*) pre=true ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl \
+            --target x86_64-apple-darwin --target aarch64-apple-darwin
+          rustup default stable
+          pip install --quiet cargo-zigbuild==0.24.1 ziglang==0.13.0
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build all targets
+        # Build, cargo and rustup paths are rewritten so no runner path is baked in.
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/src --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME/.rustup=/rustup"
+          mkdir dist
+          build() { # rust-target asset-name
+            cargo zigbuild --release --locked --target "$1"
+            cp "target/$1/release/ndo4git" "dist/$2"
+          }
+          build x86_64-unknown-linux-musl  ndo4git-x86_64-linux-musl
+          build aarch64-unknown-linux-musl ndo4git-aarch64-linux-musl
+          build x86_64-apple-darwin        ndo4git-x86_64-apple-darwin
+          build aarch64-apple-darwin       ndo4git-aarch64-apple-darwin
+
+      - name: Verify binaries
+        run: |
+          for a in x86_64 aarch64; do
+            file "dist/ndo4git-$a-linux-musl" | grep -qE "statically linked|static-pie" \
+              || { echo "ndo4git-$a-linux-musl is not static" >&2; exit 1; }
+          done
+          chmod +x dist/ndo4git-x86_64-linux-musl
+          dist/ndo4git-x86_64-linux-musl --version | grep -qF "$VERSION"
+          for f in dist/ndo4git-*; do
+            grep -aqF "$VERSION" "$f" || { echo "$f does not carry version $VERSION" >&2; exit 1; }
+            # nothing about the build machine or its user may be baked in
+            if grep -aqE "/home/runner|/Users/runner|/opt/hostedtoolcache|runner@" "$f"; then
+              echo "build-machine information found in $f" >&2; exit 1
+            fi
+          done
+
+      - name: Smoke test on other distributions
+        run: |
+          for image in alpine:latest debian:12 ubuntu:22.04 fedora:latest; do
+            docker run --rm -v "$PWD/dist/ndo4git-x86_64-linux-musl:/ndo4git:ro" "$image" \
+              sh -c '/ndo4git --version >/dev/null && /ndo4git schema >/dev/null' \
+              || { echo "smoke test failed on $image" >&2; exit 1; }
+            echo "ok: $image"
+          done
+
+      - name: Debian packages
+        run: |
+          export GEN_BIN=dist/ndo4git-x86_64-linux-musl
+          scripts/build-deb.sh dist/ndo4git-x86_64-linux-musl  amd64 "dist/ndo4git_${VERSION}_amd64.deb"
+          scripts/build-deb.sh dist/ndo4git-aarch64-linux-musl arm64 "dist/ndo4git_${VERSION}_arm64.deb"
+
+      - name: Checksums and release notes
+        run: |
+          (cd dist && sha256sum ndo4git-* ndo4git_*.deb > SHA256SUMS && cat SHA256SUMS)
+          awk -v v="$VERSION" '$0 ~ "^## "v"$" {f=1; next} /^## /{f=0} f' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "ndo4git $VERSION" > notes.md
+          {
+            echo
+            echo "### Downloads"
+            echo "* Linux, any distribution (static): \`ndo4git-x86_64-linux-musl\`, \`ndo4git-aarch64-linux-musl\`"
+            echo "* macOS: \`ndo4git-aarch64-apple-darwin\` (Apple Silicon), \`ndo4git-x86_64-apple-darwin\` (Intel)"
+            echo "* Debian / Ubuntu: \`ndo4git_${VERSION}_amd64.deb\`, \`ndo4git_${VERSION}_arm64.deb\`"
+            echo
+            echo "Verify with \`sha256sum -c SHA256SUMS\` and \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\`."
+          } >> notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: |
+            dist/*
+            notes.md
+          retention-days: 7
+
+      - name: Build provenance
+        if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRE: ${{ steps.v.outputs.prerelease }}
+        run: |
+          flag=""; [ "$PRE" = true ] && flag="--prerelease"
+          gh release create "$GITHUB_REF_NAME" $flag --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "ndo4git $VERSION" --notes-file notes.md dist/*

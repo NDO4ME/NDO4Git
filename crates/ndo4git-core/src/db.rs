@@ -34,6 +34,7 @@ pub struct KeyRow {
     pub algo: String,
     pub public_key: String,
     pub fingerprint: String,
+    #[serde(skip)]
     pub can_write: bool,
     pub created_at: i64,
     pub rotated_at: Option<i64>,

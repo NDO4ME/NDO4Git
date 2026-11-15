@@ -5,14 +5,23 @@ mod cli;
 mod commands;
 mod prompt;
 mod render;
-mod update;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os();
-    let _argv0 = args.next();
+    let argv0 = args.next();
+
+    // `git` symlink: exec the real git before anything else is set up.
+    if argv0
+        .as_deref()
+        .is_some_and(ndo4git_core::gitshim::invoked_as_git)
+    {
+        let code = ndo4git_core::gitshim::exec_real_git(args.collect());
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
+
     let first = args.next();
 
     // Hot path: git invokes `ndo4git ssh-wrapper <ssh args...>`. Handle it

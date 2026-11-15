@@ -13,11 +13,10 @@ pub fn settings_url(forge: Forge, host: &str, repo: &str) -> String {
 #[must_use]
 pub fn new_block(k: &KeyRow, forge: Forge) -> String {
     format!(
-        "Repo:        {}\nFingerprint: {}\nAdd this public key at:\n{}\n(Allow write access: {})\n\n{}\n",
+        "Repo:        {}\nFingerprint: {}\nAdd this public key at:\n{}\n\n{}\n",
         k.repo,
         k.fingerprint,
         settings_url(forge, &k.host, &k.repo),
-        if k.can_write { "yes" } else { "no" },
         k.public_key
     )
 }
@@ -28,7 +27,6 @@ pub struct NewJson<'a> {
     pub host: &'a str,
     pub fingerprint: &'a str,
     pub public_key: &'a str,
-    pub can_write: bool,
     pub forge: &'static str,
     pub settings_url: String,
     pub created: bool,
@@ -41,7 +39,6 @@ pub fn new_json(k: &KeyRow, forge: Forge, created: bool) -> NewJson<'_> {
         host: &k.host,
         fingerprint: &k.fingerprint,
         public_key: &k.public_key,
-        can_write: k.can_write,
         forge: forge.name(),
         settings_url: settings_url(forge, &k.host, &k.repo),
         created,
@@ -68,7 +65,7 @@ mod tests {
         };
         assert_eq!(
             new_block(&k, Forge::GitHub),
-            "Repo:        o/r\nFingerprint: SHA256:abc\nAdd this public key at:\nhttps://github.com/o/r/settings/keys/new\n(Allow write access: no)\n\nssh-ed25519 AAAA ndo4git:o/r@h\n"
+            "Repo:        o/r\nFingerprint: SHA256:abc\nAdd this public key at:\nhttps://github.com/o/r/settings/keys/new\n\nssh-ed25519 AAAA ndo4git:o/r@h\n"
         );
     }
 }

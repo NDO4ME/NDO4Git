@@ -9,8 +9,19 @@ use std::path::PathBuf;
     version,
     about = "Transparent per-repository SSH keys for git over SSH (GitHub, Codeberg/Forgejo, GitLab)",
     long_about = "ndo4git picks a dedicated SSH key per repository whenever the system \
-git talks to GitHub, Codeberg (Forgejo) or GitLab over SSH, and manages those keys in a local, encrypted SQLite database.\n\n\
-Install once (as root) with `sudo ndo4git install`; afterwards git push/pull/fetch/clone work unchanged."
+git talks to GitHub, Codeberg (Forgejo) or GitLab over SSH, and manages those keys in a local, encrypted SQLite database. \
+A declarative manifest (`init`, `plan`, `apply`, `rollback`) derives hosts, keys, aliases, per-repository git identities and \
+performance settings from one file.\n\n\
+Install once (as root) with `sudo ndo4git install`; afterwards git push/pull/fetch/clone work unchanged.",
+    after_help = "EXAMPLES:\n  \
+ndo4git new acme/widget            create a key and print where to add it\n  \
+ndo4git init && ndo4git plan       start a manifest, preview changes\n  \
+ndo4git apply                      reconcile reality with the manifest\n  \
+ndo4git whoami                     which git identity applies here\n  \
+ndo4git schema                     machine-readable description of every command\n\n\
+EXIT STATUS:\n  0 success   1 error   2 `new`: key already exists / `plan --check`: changes pending\n\n\
+Commands with --json print JSON to stdout only; diagnostics and errors go to stderr. Nothing prompts\n\
+unless a backup passphrase is needed and neither NDO4GIT_BACKUP_PASSPHRASE nor --passphrase-file is set."
 )]
 pub struct Cli {
     /// Host the repository lives on (default: github.com; ignored when a URL is given)
@@ -20,6 +31,10 @@ pub struct Cli {
     /// When running as root under sudo, use `$SUDO_USER`'s data directory
     #[arg(long, global = true)]
     pub sudo_user_home: bool,
+
+    /// Manifest file (default: ~/.config/ndo4git/manifest.toml)
+    #[arg(long, global = true, value_name = "FILE", env = "NDO4GIT_MANIFEST")]
+    pub manifest: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -34,9 +49,6 @@ pub enum Command {
         /// Replace an existing key (the old public key is kept in history)
         #[arg(long)]
         rotate: bool,
-        /// Record that the deploy key should have write access
-        #[arg(long)]
-        write: bool,
         /// Public key comment (default: ndo4git:OWNER/REPO@HOSTNAME)
         #[arg(long, value_name = "STR")]
         comment: Option<String>,
@@ -70,8 +82,6 @@ pub enum Command {
         /// Replace an existing key
         #[arg(long)]
         force: bool,
-        #[arg(long)]
-        write: bool,
         #[arg(long, value_name = "STR")]
         comment: Option<String>,
     },
@@ -96,11 +106,6 @@ pub enum Command {
         #[command(subcommand)]
         action: HostAction,
     },
-    /// Check installation, configuration, permissions and database health
-    Doctor {
-        #[arg(long)]
-        json: bool,
-    },
     /// Write an encrypted backup of all keys
     Backup {
         file: PathBuf,
@@ -120,21 +125,43 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<PathBuf>,
     },
-    /// Update ndo4git to the latest release from Codeberg
-    Update {
-        /// Only report whether an update is available
-        #[arg(long)]
-        check: bool,
-        /// Install this version instead of the latest (e.g. 0.2.1)
-        #[arg(long, value_name = "VERSION")]
-        version: Option<String>,
-        /// Reinstall even if the version is the same or older
+    /// Write a starter manifest that reproduces the current state
+    Init {
+        /// Overwrite an existing manifest
         #[arg(long)]
         force: bool,
     },
+    /// Show what `apply` would change to make reality match the manifest
+    Plan {
+        /// Exit with status 2 when changes are pending (drift check for scripts/CI)
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make reality match the manifest (hosts, keys, aliases, git identities, settings)
+    Apply {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Undo the last `apply`
+    Rollback {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show which manifest identity applies to a repository and whether git uses it
+    Whoami {
+        /// OWNER/REPO, HOST/PATH or a clone URL (default: `origin` of the current directory)
+        target: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a machine-readable description of all commands, options, exit codes and environment (JSON)
+    Schema,
     /// Install system-wide (root): binary, git-ndo4git link, /etc/gitconfig
     Install,
-    /// Reverse `install` (root); user data is kept unless --purge
+    /// Internal: reverse `install` (used by the .deb prerm script)
+    #[command(hide = true)]
     Uninstall {
         /// Also delete every user's ~/.config/ndo4git
         #[arg(long)]
@@ -149,7 +176,10 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum HostAction {
     /// Show managed hosts
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage keys for HOST too
     Add {
         host: String,
@@ -169,5 +199,4 @@ pub enum Shell {
     Zsh,
     Fish,
     Elvish,
-    Powershell,
 }

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: Check and cross-build all targets
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy \
+            --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl \
+            --target x86_64-apple-darwin --target aarch64-apple-darwin
+          rustup default stable
+          pip install --quiet cargo-zigbuild==0.24.1 ziglang==0.13.0
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Cross-build Linux (static musl) and macOS
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo zigbuild --release --locked --target "$t"
+          done
+          file target/x86_64-unknown-linux-musl/release/ndo4git | grep -qE "statically linked|static-pie"

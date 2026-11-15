@@ -7,10 +7,11 @@ use clap::{CommandFactory, Parser};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 use ndo4git_core::crypto::{record_aad, MasterKey};
 use ndo4git_core::db::{Db, KeyRow, NewKey};
-use ndo4git_core::doctor::{self, Status};
 use ndo4git_core::exec::HostKeyPolicy;
 use ndo4git_core::forge::Forge;
-use ndo4git_core::install::Plan;
+use ndo4git_core::install::{write_atomic, Plan};
+use ndo4git_core::manifest::{Manifest, MANIFEST_FILE};
+use ndo4git_core::plan as reconcile;
 use ndo4git_core::repo::{normalize_host, parse_remote_url, parse_target, DEFAULT_HOST};
 use ndo4git_core::util::{fmt_ts, hostname, now_unix};
 use ndo4git_core::{backup, keygen, paths};
@@ -22,6 +23,9 @@ use zeroize::Zeroizing;
 /// Exit code when `new` finds an existing key and `--rotate` was not given.
 const EXIT_EXISTS: u8 = 2;
 
+/// Exit code of `plan --check` when the manifest and reality differ.
+const EXIT_DRIFT: u8 = 2;
+
 pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let sudo = cli.sudo_user_home;
@@ -30,7 +34,6 @@ pub fn run() -> Result<ExitCode> {
         Command::New {
             target,
             rotate,
-            write,
             comment,
             json,
         } => cmd_new(
@@ -38,7 +41,6 @@ pub fn run() -> Result<ExitCode> {
             host_flag,
             target.as_deref(),
             rotate,
-            write,
             comment.as_deref(),
             json,
         ),
@@ -54,22 +56,12 @@ pub fn run() -> Result<ExitCode> {
             repo,
             file,
             force,
-            write,
             comment,
-        } => cmd_import(
-            sudo,
-            host_flag,
-            &repo,
-            &file,
-            force,
-            write,
-            comment.as_deref(),
-        ),
+        } => cmd_import(sudo, host_flag, &repo, &file, force, comment.as_deref()),
         Command::ExportPub { repo } => cmd_export_pub(sudo, host_flag, &repo),
         Command::ExportPrivate { repo, yes } => cmd_export_private(sudo, host_flag, &repo, yes),
         Command::Alias { old, new, remove } => cmd_alias(sudo, host_flag, &old, &new, remove),
         Command::Host { action } => cmd_host(sudo, action),
-        Command::Doctor { json } => cmd_doctor(sudo, json),
         Command::Backup {
             file,
             force,
@@ -80,11 +72,18 @@ pub fn run() -> Result<ExitCode> {
             overwrite,
             passphrase_file,
         } => cmd_restore(sudo, &file, overwrite, passphrase_file.as_deref()),
-        Command::Update {
-            check,
-            version,
-            force,
-        } => crate::update::run(check, version.as_deref(), force),
+        Command::Init { force } => cmd_init(sudo, cli.manifest.as_deref(), force),
+        Command::Plan { check, json } => cmd_plan(sudo, cli.manifest.as_deref(), check, json),
+        Command::Apply { json } => cmd_apply(sudo, cli.manifest.as_deref(), json),
+        Command::Rollback { json } => cmd_rollback(sudo, json),
+        Command::Whoami { target, json } => cmd_whoami(
+            sudo,
+            cli.manifest.as_deref(),
+            host_flag,
+            target.as_deref(),
+            json,
+        ),
+        Command::Schema => cmd_schema(),
         Command::Install => {
             for l in Plan::system()?.install()? {
                 println!("{l}");
@@ -104,7 +103,6 @@ pub fn run() -> Result<ExitCode> {
                 Shell::Zsh => clap_complete::Shell::Zsh,
                 Shell::Fish => clap_complete::Shell::Fish,
                 Shell::Elvish => clap_complete::Shell::Elvish,
-                Shell::Powershell => clap_complete::Shell::PowerShell,
             };
             clap_complete::generate(sh, &mut cmd, "ndo4git", &mut std::io::stdout());
             Ok(ExitCode::SUCCESS)
@@ -184,7 +182,6 @@ fn save(
     host: &str,
     k: &keygen::KeyMaterial,
     st: &Stored,
-    can_write: bool,
     replace_reason: Option<&str>,
 ) -> Result<()> {
     let nk = NewKey {
@@ -195,7 +192,7 @@ fn save(
         private_key_enc: &st.enc,
         nonce: &st.nonce,
         fingerprint: &k.fingerprint,
-        can_write,
+        can_write: false,
         created_at: now_unix(),
         last_used_at: None,
     };
@@ -223,7 +220,6 @@ fn cmd_new(
     host_flag: Option<&str>,
     target: Option<&str>,
     rotate: bool,
-    write: bool,
     comment: Option<&str>,
     json: bool,
 ) -> Result<ExitCode> {
@@ -255,7 +251,6 @@ fn cmd_new(
         &host,
         &material,
         &stored,
-        write,
         existing.as_ref().map(|_| "rotate"),
     )?;
     warn_if_unmanaged_host(&db, &host)?;
@@ -277,20 +272,12 @@ fn cmd_list(sudo: bool, json: bool) -> Result<ExitCode> {
     }
     let mut t = Table::new();
     t.load_preset(UTF8_FULL_CONDENSED);
-    t.set_header([
-        "REPO",
-        "HOST",
-        "FINGERPRINT",
-        "WRITE",
-        "CREATED",
-        "LAST USED",
-    ]);
+    t.set_header(["REPO", "HOST", "FINGERPRINT", "CREATED", "LAST USED"]);
     for k in &keys {
         t.add_row([
             k.repo.clone(),
             k.host.clone(),
             k.fingerprint.clone(),
-            if k.can_write { "yes" } else { "no" }.to_owned(),
             fmt_ts(k.created_at),
             ts(k.last_used_at),
         ]);
@@ -327,7 +314,6 @@ fn cmd_show(sudo: bool, host_flag: Option<&str>, repo: &str, json: bool) -> Resu
     println!("Host:         {}", k.host);
     println!("Algorithm:    {}", k.algo);
     println!("Fingerprint:  {}", k.fingerprint);
-    println!("Write access: {}", if k.can_write { "yes" } else { "no" });
     println!("Created:      {}", fmt_ts(k.created_at));
     println!("Rotated:      {}", ts(k.rotated_at));
     println!("Last used:    {}", ts(k.last_used_at));
@@ -369,7 +355,6 @@ fn cmd_import(
     repo: &str,
     file: &Path,
     force: bool,
-    write: bool,
     comment: Option<&str>,
 ) -> Result<ExitCode> {
     let (host, repo) = resolve(host_flag, repo)?;
@@ -400,7 +385,6 @@ fn cmd_import(
         &host,
         &material,
         &stored,
-        write,
         exists.then_some("import"),
     )?;
     warn_if_unmanaged_host(&db, &host)?;
@@ -472,7 +456,15 @@ fn cmd_host(sudo: bool, action: HostAction) -> Result<ExitCode> {
     let (_, db) = open_db(sudo)?;
     let mut hosts = db.hosts()?;
     match action {
-        HostAction::List => {}
+        HostAction::List { json } => {
+            if json {
+                let rows = hosts
+                    .iter()
+                    .map(|h| Ok(serde_json::json!({ "host": h, "forge": db.forge(h)?.name() })))
+                    .collect::<Result<Vec<_>>>()?;
+                return print_json(&rows).map(|()| ExitCode::SUCCESS);
+            }
+        }
         HostAction::Add { host, forge } => {
             let h = normalize_host(&host)?;
             if let Some(f) = forge {
@@ -511,32 +503,6 @@ fn cmd_host(sudo: bool, action: HostAction) -> Result<ExitCode> {
         println!("{h}\t{}", db.forge(&h)?);
     }
     Ok(ExitCode::SUCCESS)
-}
-
-fn cmd_doctor(sudo: bool, json: bool) -> Result<ExitCode> {
-    let checks = doctor::run(&Plan::system()?, sudo);
-    if json {
-        print_json(&checks)?;
-    } else {
-        let mut t = Table::new();
-        t.load_preset(UTF8_FULL_CONDENSED);
-        t.set_header(["", "CHECK", "DETAIL"]);
-        for c in &checks {
-            let s = match c.status {
-                Status::Ok => "OK",
-                Status::Warn => "WARN",
-                Status::Fail => "FAIL",
-            };
-            t.add_row([s, c.name, c.detail.as_str()]);
-        }
-        println!("{t}");
-    }
-    let failed = checks.iter().any(|c| c.status == Status::Fail);
-    Ok(if failed {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
 }
 
 fn cmd_backup(sudo: bool, file: &Path, force: bool, pw_file: Option<&Path>) -> Result<ExitCode> {
@@ -588,5 +554,335 @@ fn cmd_restore(
             println!("{label}: {i}");
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ------------------------------------------------------------------ manifest
+
+fn manifest_path(dir: &Path, over: Option<&Path>) -> PathBuf {
+    over.map_or_else(|| dir.join(MANIFEST_FILE), Path::to_path_buf)
+}
+
+fn load_manifest(path: &Path) -> Result<Manifest> {
+    let meta = std::fs::metadata(path).with_context(|| {
+        format!(
+            "no manifest at {} (create one with `ndo4git init`)",
+            path.display()
+        )
+    })?;
+    if meta.len() > 1 << 20 {
+        bail!("{} is larger than 1 MiB", path.display());
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Manifest::parse(&text)?)
+}
+
+fn print_actions(actions: &[reconcile::Action]) {
+    for a in actions {
+        println!("{} {}", a.symbol(), a.describe());
+    }
+}
+
+fn cmd_init(sudo: bool, over: Option<&Path>, force: bool) -> Result<ExitCode> {
+    let (dir, db) = open_db(sudo)?;
+    let path = manifest_path(&dir, over);
+    if path.exists() && !force {
+        bail!("{} exists; use --force to overwrite", path.display());
+    }
+    let ctx = reconcile::Ctx {
+        dir: &dir,
+        git_env: &[],
+    };
+    let text = reconcile::init_manifest(&reconcile::gather(&ctx, &db)?)?;
+    write_atomic(&path, text.as_bytes(), 0o600)?;
+    eprintln!("wrote {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_plan(sudo: bool, over: Option<&Path>, check: bool, json: bool) -> Result<ExitCode> {
+    let (dir, db) = open_db(sudo)?;
+    let manifest = load_manifest(&manifest_path(&dir, over))?;
+    let ctx = reconcile::Ctx {
+        dir: &dir,
+        git_env: &[],
+    };
+    let actions = reconcile::plan(&ctx, &db, &manifest)?;
+    if json {
+        print_json(&actions)?;
+    } else if actions.is_empty() {
+        println!("up to date: the manifest matches reality");
+    } else {
+        print_actions(&actions);
+        println!("{} change(s) pending; run `ndo4git apply`", actions.len());
+    }
+    Ok(if check && !actions.is_empty() {
+        ExitCode::from(EXIT_DRIFT)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn cmd_apply(sudo: bool, over: Option<&Path>, json: bool) -> Result<ExitCode> {
+    if sudo {
+        bail!(
+            "apply changes the invoking user's git configuration; run it without --sudo-user-home"
+        );
+    }
+    refuse_root("apply")?;
+    let (dir, mut db) = open_db(sudo)?;
+    let _lock = reconcile::lock(&dir)?;
+    let manifest = load_manifest(&manifest_path(&dir, over))?;
+    let ctx = reconcile::Ctx {
+        dir: &dir,
+        git_env: &[],
+    };
+    if !manifest.identities.is_empty() {
+        reconcile::require_hasconfig(ctx.git_env)?;
+    }
+    let actions = reconcile::plan(&ctx, &db, &manifest)?;
+    if !json {
+        if actions.is_empty() {
+            println!("up to date: nothing to do");
+            return Ok(ExitCode::SUCCESS);
+        }
+        print_actions(&actions);
+    }
+    reconcile::apply(&ctx, &mut db, &actions)?;
+    let mut created = Vec::new();
+    for a in &actions {
+        if let reconcile::Action::KeyCreate { host, repo } = a {
+            created.push(require_key(&db, host, repo)?);
+        }
+    }
+    if json {
+        let keys = created
+            .iter()
+            .map(|k| Ok(render::new_json(k, db.forge(&k.host)?, true)))
+            .collect::<Result<Vec<_>>>()?;
+        print_json(&serde_json::json!({ "applied": actions, "created_keys": keys }))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!(
+        "applied {} change(s); undo with `ndo4git rollback`",
+        actions.len()
+    );
+    for k in &created {
+        println!();
+        print!("{}", render::new_block(k, db.forge(&k.host)?));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `apply` and `rollback` edit the invoking user's `~/.gitconfig`; as root they
+/// would write root-owned files into a user's home or the wrong home.
+fn refuse_root(what: &str) -> Result<()> {
+    if nix::unistd::geteuid().is_root() {
+        bail!("`{what}` edits your git configuration; run it as your normal user, not root/sudo");
+    }
+    Ok(())
+}
+
+fn cmd_rollback(sudo: bool, json: bool) -> Result<ExitCode> {
+    refuse_root("rollback")?;
+    let (dir, mut db) = open_db(sudo)?;
+    let _lock = reconcile::lock(&dir)?;
+    let ctx = reconcile::Ctx {
+        dir: &dir,
+        git_env: &[],
+    };
+    let report = reconcile::rollback(&ctx, &mut db)?;
+    for w in &report.warnings {
+        eprintln!("ndo4git: {w}");
+    }
+    if json {
+        print_json(&report)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    for a in report.reverted.iter().rev() {
+        println!("reverted {} {}", a.symbol(), a.describe());
+    }
+    println!("rolled back {} change(s)", report.reverted.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn git_config_value(key: &str) -> Option<String> {
+    let o = std::process::Command::new("git")
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// One compared identity field for `whoami`.
+struct Field {
+    label: &'static str,
+    key: &'static str,
+    want: String,
+    have: Option<String>,
+}
+
+fn cmd_whoami(
+    sudo: bool,
+    over: Option<&Path>,
+    host_flag: Option<&str>,
+    target: Option<&str>,
+    json: bool,
+) -> Result<ExitCode> {
+    let (host, repo) = match target {
+        Some(t) => resolve(host_flag, t)?,
+        None => origin_remote()?,
+    };
+    let dir = paths::config_dir(sudo)?;
+    let manifest = load_manifest(&manifest_path(&dir, over))?;
+    let matching = manifest.identities_for(&host, &repo);
+    let Some(last) = matching.last() else {
+        if json {
+            print_json(&serde_json::json!({
+                "host": host, "repo": repo, "identity": null, "ok": true
+            }))?;
+        } else {
+            println!("Repo:      {repo} on {host}");
+            println!("Identity:  none (no manifest identity matches)");
+        }
+        return Ok(ExitCode::SUCCESS);
+    };
+    // git includes every matching identity and later ones override earlier ones per field
+    let name = matching.iter().rev().find_map(|i| i.name.as_deref());
+    let email = matching.iter().rev().find_map(|i| i.email.as_deref());
+    let ids: Vec<&str> = matching.iter().map(|i| i.id.as_str()).collect();
+    // only compare with git when inspecting the repository we are standing in
+    let live = target.is_none();
+    let mut fields = Vec::new();
+    for (label, key, want) in [("Name", "user.name", name), ("Email", "user.email", email)] {
+        if let Some(want) = want {
+            fields.push(Field {
+                label,
+                key,
+                want: want.to_owned(),
+                have: if live { git_config_value(key) } else { None },
+            });
+        }
+    }
+    let ok = fields
+        .iter()
+        .all(|f| !live || f.have.as_deref() == Some(f.want.as_str()));
+    if json {
+        let detail: Vec<_> = fields
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "key": f.key, "expected": f.want,
+                    "actual": f.have, "matches": !live || f.have.as_deref() == Some(f.want.as_str()),
+                })
+            })
+            .collect();
+        print_json(&serde_json::json!({
+            "host": host, "repo": repo, "identity": last.id, "identities": ids,
+            "checked_against_git": live, "fields": detail, "ok": ok
+        }))?;
+    } else {
+        println!("Repo:      {repo} on {host}");
+        println!("Identity:  {}", ids.join(" + "));
+        for f in &fields {
+            let note = match (&f.have, live) {
+                (have, true) if have.as_deref() != Some(f.want.as_str()) => format!(
+                    "   MISMATCH: git uses {}",
+                    have.as_deref().unwrap_or("(unset)")
+                ),
+                _ => String::new(),
+            };
+            println!("{:<10} {}{note}", format!("{}:", f.label), f.want);
+        }
+    }
+    if !ok {
+        eprintln!("ndo4git: git is not using this identity; run `ndo4git apply`");
+    }
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+// ------------------------------------------------------------------ schema
+
+fn arg_json(a: &clap::Arg) -> serde_json::Value {
+    serde_json::json!({
+        "name": a.get_id().as_str(),
+        "long": a.get_long().map(|l| format!("--{l}")),
+        "short": a.get_short().map(|c| format!("-{c}")),
+        "positional": a.is_positional(),
+        "required": a.is_required_set(),
+        "takes_value": a.get_action().takes_values(),
+        "value_name": a.get_value_names().and_then(|v| v.first()).map(ToString::to_string),
+        "env": a.get_env().map(|e| e.to_string_lossy().into_owned()),
+        "help": a.get_help().map(ToString::to_string),
+    })
+}
+
+fn command_json(c: &clap::Command, path: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for sub in c.get_subcommands().filter(|s| !s.is_hide_set()) {
+        if sub.get_name() == "help" {
+            continue;
+        }
+        let p = if path.is_empty() {
+            sub.get_name().to_owned()
+        } else {
+            format!("{path} {}", sub.get_name())
+        };
+        let args: Vec<_> = sub
+            .get_arguments()
+            .filter(|a| !a.is_hide_set() && !a.is_global_set())
+            .filter(|a| !matches!(a.get_id().as_str(), "help" | "version"))
+            .map(arg_json)
+            .collect();
+        let nested = command_json(sub, &p);
+        out.push(serde_json::json!({
+            "command": p,
+            "about": sub.get_about().map(ToString::to_string),
+            "args": args,
+            "has_json_output": sub.get_arguments().any(|a| a.get_id().as_str() == "json"),
+        }));
+        out.extend(nested);
+    }
+    out
+}
+
+/// Machine-readable description of the CLI, generated from the clap definitions
+/// so it can never drift from the real options.
+fn cmd_schema() -> Result<ExitCode> {
+    let root = Cli::command();
+    let global: Vec<_> = root
+        .get_arguments()
+        .filter(|a| a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"))
+        .map(arg_json)
+        .collect();
+    print_json(&serde_json::json!({
+        "name": "ndo4git",
+        "version": env!("CARGO_PKG_VERSION"),
+        "about": root.get_about().map(ToString::to_string),
+        "global_options": global,
+        "commands": command_json(&root, ""),
+        "exit_codes": {
+            "0": "success",
+            "1": "error (message on stderr)",
+            "2": "`new`: a key already exists (use --rotate); `plan --check`: changes pending"
+        },
+        "conventions": [
+            "commands with --json write JSON to stdout only; diagnostics and errors go to stderr",
+            "repository arguments accept OWNER/REPO, GROUP/SUB/PROJECT, HOST/PATH or a clone URL",
+            "no command prompts unless a backup passphrase is needed (NDO4GIT_BACKUP_PASSPHRASE or --passphrase-file avoid it)",
+            "apply and plan are idempotent; rollback undoes the last apply"
+        ],
+        "environment": [
+            "NDO4GIT_MANIFEST", "NDO4GIT_BACKUP_PASSPHRASE", "NDO4GIT_DEBUG",
+            "NDO4GIT_SSH", "NDO4GIT_SUDO_USER_HOME", "XDG_CONFIG_HOME"
+        ],
+    }))?;
     Ok(ExitCode::SUCCESS)
 }

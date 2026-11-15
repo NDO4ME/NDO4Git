@@ -105,11 +105,28 @@ exit "${FAKE_SSH_EXIT:-0}"
     }
 }
 
-const MANAGED_OPTS: [&str; 6] = [
+/// ssh itself parsed the private key: its `identity file ... type N` line has
+/// a real key type (the numbering differs between OpenSSH versions; -1 = unusable).
+fn assert_key_parsed(err: &str) {
+    let ok = err.lines().any(|l| {
+        l.contains("identity file ")
+            && !l.contains("-cert")
+            && l.rsplit(" type ")
+                .next()
+                .is_some_and(|t| t.trim().parse::<i32>().is_ok_and(|n| n >= 0))
+    });
+    assert!(ok, "{err}");
+}
+
+const MANAGED_OPTS: [&str; 10] = [
     "-o",
     "IdentitiesOnly=yes",
     "-o",
     "IdentityAgent=none",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
     "-o",
     "StrictHostKeyChecking=accept-new",
 ];
@@ -121,8 +138,8 @@ fn assert_managed(got: &[String], orig: &[&str]) {
         got[1].starts_with("/proc/") && got[1].contains("/fd/"),
         "{got:?}"
     );
-    assert_eq!(&got[2..8], MANAGED_OPTS, "{got:?}");
-    assert_eq!(&got[8..], orig, "{got:?}");
+    assert_eq!(&got[2..12], MANAGED_OPTS, "{got:?}");
+    assert_eq!(&got[12..], orig, "{got:?}");
 }
 
 fn s(o: &Output) -> String {
@@ -519,16 +536,15 @@ fn real_git_drives_the_wrapper() {
 #[test]
 fn new_output_format_and_exit_codes() {
     let e = Env::new();
-    let out = e.ok(&["new", "Foo/Bar", "--write", "--comment", "hello"]);
+    let out = e.ok(&["new", "Foo/Bar", "--comment", "hello"]);
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 7, "{out}");
+    assert_eq!(lines.len(), 6, "{out}");
     assert_eq!(lines[0], "Repo:        foo/bar");
     assert!(lines[1].starts_with("Fingerprint: SHA256:"));
     assert_eq!(lines[2], "Add this public key at:");
     assert_eq!(lines[3], "https://github.com/foo/bar/settings/keys/new");
-    assert_eq!(lines[4], "(Allow write access: yes)");
-    assert_eq!(lines[5], "");
-    assert!(lines[6].starts_with("ssh-ed25519 AAAA") && lines[6].ends_with(" hello"));
+    assert_eq!(lines[4], "");
+    assert!(lines[5].starts_with("ssh-ed25519 AAAA") && lines[5].ends_with(" hello"));
 
     // duplicate: prints key, exits 2
     let o = e.run(&["new", "foo/bar"]);
@@ -669,7 +685,7 @@ fn private_keys_never_stored_in_plaintext() {
 fn backup_and_restore_roundtrip() {
     let a = Env::new();
     let pem_a = {
-        a.ok(&["new", "o/r", "--write"]);
+        a.ok(&["new", "o/r"]);
         a.ok(&["export-private", "o/r", "--yes"])
     };
     let file = a.cfg.path().join("backup.n4g");
@@ -717,22 +733,6 @@ fn nix_is_root() -> bool {
 }
 
 #[test]
-fn doctor_warns_about_overrides() {
-    let e = Env::new();
-    let o = e
-        .cmd()
-        .env("GIT_SSH_COMMAND", "ssh -v")
-        .args(["doctor", "--json"])
-        .output()
-        .unwrap();
-    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    let warn = j.as_array().unwrap().iter().any(|c| {
-        c["status"] == "warn" && c["detail"].as_str().unwrap().contains("GIT_SSH_COMMAND")
-    });
-    assert!(warn, "{j}");
-}
-
-#[test]
 fn completions_and_man_work() {
     let e = Env::new();
     assert!(e.ok(&["completions", "bash"]).contains("ndo4git"));
@@ -771,8 +771,7 @@ fn real_openssh_can_load_the_key() {
     assert!(!err.contains("not accessible"), "{err}");
     assert!(err.contains("identity file /proc/"), "{err}");
     assert!(!err.contains("no such identity"), "{err}");
-    // ed25519 private key was parsed by ssh itself
-    assert!(err.contains("type 2"), "{err}");
+    assert_key_parsed(&err);
 }
 
 /// The file-staging path (used on macOS) driven by real OpenSSH: the key is
@@ -810,7 +809,7 @@ fn file_staging_works_with_real_openssh_and_cleans_up() {
     let err = s(&o);
     assert!(!err.contains("not accessible"), "{err}");
     assert!(err.contains("/ndo4git-") && err.contains("/key-"), "{err}");
-    assert!(err.contains("type 2"), "{err}");
+    assert_key_parsed(&err);
     let dir = fs::read_dir(&run).unwrap().next().unwrap().unwrap().path();
     assert_eq!(
         fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
@@ -935,311 +934,641 @@ fn github_codeberg_and_gitlab_work_out_of_the_box() {
         .success());
 }
 
-// ---------------------------------------------------------------- update
+// ---------------------------------------------------------------- manifest
 
-mod update {
+mod manifest {
     use super::*;
-    use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
 
-    const CURRENT: &str = env!("CARGO_PKG_VERSION");
-
-    /// Tiny HTTP server: path -> (status, body). Runs for the life of the test process.
-    fn serve(routes: HashMap<String, (u16, Vec<u8>)>) -> u16 {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in l.incoming() {
-                let Ok(mut s) = stream else { continue };
-                let mut buf = [0u8; 4096];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                let (code, body) = routes
-                    .get(&path)
-                    .cloned()
-                    .unwrap_or((404, b"not found".to_vec()));
-                let head = format!(
-                    "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = s.write_all(head.as_bytes());
-                let _ = s.write_all(&body);
-            }
-        });
-        port
+    /// Environment with a real `git` on PATH and an isolated global gitconfig.
+    struct M {
+        e: Env,
+        gitconfig: PathBuf,
     }
 
-    fn arch_asset() -> String {
-        format!("ndo4git-{}-linux-musl", std::env::consts::ARCH) // tests run on Linux
-    }
-
-    struct Fixture {
-        _dir: TempDir,
-        exe: PathBuf,
-        port: u16,
-        env: Env,
-        pubkey: String,
-    }
-
-    #[derive(Clone, Copy, PartialEq)]
-    enum Sig {
-        Good,
-        Missing,
-        WrongKey,
-        WrongNamespace,
-    }
-
-    /// Generate an ed25519 key with the real `ssh-keygen`; returns (private path, public line).
-    fn gen_key(dir: &Path, name: &str) -> (PathBuf, String) {
-        let key = dir.join(name);
-        let o = Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-C", "t", "-f"])
-            .arg(&key)
-            .output()
-            .unwrap();
-        assert!(o.status.success());
-        let pubk = fs::read_to_string(dir.join(format!("{name}.pub"))).unwrap();
-        (key, pubk.trim().to_owned())
-    }
-
-    /// Sign `data` exactly like scripts/release.sh does.
-    fn sign_like_release(dir: &Path, key: &Path, ns: &str, data: &[u8]) -> Vec<u8> {
-        let payload = dir.join("payload");
-        let _ = fs::remove_file(dir.join("payload.sig"));
-        fs::write(&payload, data).unwrap();
-        let o = Command::new("ssh-keygen")
-            .args(["-Y", "sign", "-n", ns, "-f"])
-            .arg(key)
-            .arg(&payload)
-            .output()
-            .unwrap();
-        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-        fs::read(dir.join("payload.sig")).unwrap()
-    }
-
-    /// `tag`: release tag; `reported`: what the new binary prints for --version;
-    /// `sha_ok`/`with_sha`: control the checksum asset.
-    fn fixture(tag: &str, reported: &str, sha_ok: bool, with_sha: bool) -> Fixture {
-        fixture_sig(tag, reported, sha_ok, with_sha, Sig::Good)
-    }
-
-    fn fixture_sig(tag: &str, reported: &str, sha_ok: bool, with_sha: bool, sig: Sig) -> Fixture {
-        let env = Env::new();
-        let dir = tempfile::tempdir().unwrap();
-        let keys = tempfile::tempdir().unwrap();
-        let (good_key, pubkey) = gen_key(keys.path(), "release");
-        let (other_key, _) = gen_key(keys.path(), "other");
-        let exe = dir.path().join("ndo4git");
-        fs::copy(BIN, &exe).unwrap();
-        let new_bin = format!("#!/bin/sh\necho 'ndo4git {reported}'\n").into_bytes();
-        let name = arch_asset();
-        let sum = if sha_ok {
-            format!("{:x}", Sha256::digest(&new_bin))
-        } else {
-            "0".repeat(64)
-        };
-        let mut routes = HashMap::new();
-        let signature = match sig {
-            Sig::Missing => None,
-            Sig::Good => Some(sign_like_release(
-                keys.path(),
-                &good_key,
-                "ndo4git-release",
-                &new_bin,
-            )),
-            Sig::WrongKey => Some(sign_like_release(
-                keys.path(),
-                &other_key,
-                "ndo4git-release",
-                &new_bin,
-            )),
-            Sig::WrongNamespace => {
-                Some(sign_like_release(keys.path(), &good_key, "file", &new_bin))
-            }
-        };
-        routes.insert("/dl/bin".to_owned(), (200, new_bin));
-        if let Some(sg) = signature {
-            routes.insert("/dl/sig".to_owned(), (200, sg));
+    impl M {
+        fn new() -> Self {
+            let e = Env::new();
+            let gitconfig = e.cfg.path().join("global.gitconfig");
+            Self { e, gitconfig }
         }
-        routes.insert(
-            "/dl/sha".to_owned(),
-            (200, format!("{sum}  {name}\n").into_bytes()),
-        );
-        // bind first and keep the listener: the port must never be released
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        let mut assets = vec![format!(
-            r#"{{"name":"{name}","browser_download_url":"http://127.0.0.1:{port}/dl/bin"}}"#
-        )];
-        if with_sha {
-            assets.push(format!(
-                r#"{{"name":"{name}.sha256","browser_download_url":"http://127.0.0.1:{port}/dl/sha"}}"#
-            ));
-        }
-        if sig != Sig::Missing {
-            assets.push(format!(
-                r#"{{"name":"{name}.sig","browser_download_url":"http://127.0.0.1:{port}/dl/sig"}}"#
-            ));
-        }
-        let assets = assets.join(",");
-        let json = format!(r#"{{"tag_name":"{tag}","assets":[{assets}]}}"#);
-        routes.insert("/api/latest".to_owned(), (200, json.clone().into_bytes()));
-        routes.insert(format!("/api/tags/{tag}"), (200, json.into_bytes()));
-        std::thread::spawn(move || {
-            for stream in l.incoming() {
-                let Ok(mut s) = stream else { continue };
-                let mut buf = [0u8; 4096];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                let (code, body) = routes
-                    .get(&path)
-                    .cloned()
-                    .unwrap_or((404, b"nope".to_vec()));
-                let head = format!(
-                    "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = s.write_all(head.as_bytes());
-                let _ = s.write_all(&body);
-            }
-        });
-        Fixture {
-            _dir: dir,
-            exe,
-            port,
-            env,
-            pubkey,
-        }
-    }
 
-    impl Fixture {
-        fn update(&self, extra: &[&str]) -> Output {
-            // Freshly copied executables can hit ETXTBSY when another test thread forks
-            // while the copy's write fd is still open; retry briefly.
-            for attempt in 0..50 {
-                let mut c = Command::new(&self.exe);
-                c.env_clear()
-                    .env("XDG_CONFIG_HOME", self.env.cfg.path().join("xdg"))
-                    .env(
-                        "NDO4GIT_RELEASES_API",
-                        format!("http://127.0.0.1:{}/api", self.port),
-                    )
-                    .env("NDO4GIT_TEST_RELEASE_PUBKEY", &self.pubkey)
-                    .arg("update")
-                    .args(extra);
-                match c.output() {
-                    Err(e) if e.raw_os_error() == Some(26) && attempt < 49 => {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    other => return other.unwrap(),
-                }
-            }
-            unreachable!()
-        }
-        fn is_original(&self) -> bool {
-            fs::read(&self.exe).unwrap() == fs::read(BIN).unwrap()
-        }
-        fn litter(&self) -> usize {
-            fs::read_dir(self.exe.parent().unwrap()).unwrap().count()
-        }
-    }
-
-    #[test]
-    fn unsigned_or_wrongly_signed_releases_are_refused() {
-        for (sig, needle) in [
-            (Sig::Missing, "unsigned"),
-            (Sig::WrongKey, "does not match"),
-            (Sig::WrongNamespace, "namespace"),
-        ] {
-            let f = fixture_sig("v99.0.0", "99.0.0", true, true, sig);
-            let o = f.update(&[]);
-            assert!(!o.status.success());
-            let err = String::from_utf8_lossy(&o.stderr).into_owned();
-            assert!(err.contains(needle), "{needle}: {err}");
-            assert!(f.is_original(), "binary must stay untouched");
-            assert_eq!(f.litter(), 1);
-        }
-    }
-
-    #[test]
-    fn up_to_date_and_check() {
-        let f = fixture(&format!("v{CURRENT}"), CURRENT, true, true);
-        let o = f.update(&[]);
-        assert!(o.status.success());
-        assert!(String::from_utf8_lossy(&o.stdout).contains("up to date"));
-        assert!(f.is_original());
-
-        let f = fixture("v99.0.0", "99.0.0", true, true);
-        let o = f.update(&["--check"]);
-        assert!(o.status.success(), "{}", s(&o));
-        assert!(String::from_utf8_lossy(&o.stdout).contains("update available"));
-        assert!(f.is_original());
-    }
-
-    #[test]
-    fn updates_in_place() {
-        let f = fixture("v99.0.0", "99.0.0", true, true);
-        let o = f.update(&[]);
-        assert!(o.status.success(), "{}", s(&o));
-        assert!(String::from_utf8_lossy(&o.stdout).contains(&format!("{CURRENT} -> 99.0.0")));
-        assert!(!f.is_original());
-        assert_eq!(
-            fs::read_to_string(&f.exe).unwrap(),
-            "#!/bin/sh\necho 'ndo4git 99.0.0'\n"
-        );
-        assert_eq!(
-            fs::metadata(&f.exe).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
-        assert_eq!(f.litter(), 1, "no staging files left behind");
-        // explicit version
-        let f = fixture("v99.0.0", "99.0.0", true, true);
-        assert!(f.update(&["--version", "99.0.0"]).status.success());
-        assert!(!f.is_original());
-    }
-
-    #[test]
-    fn refuses_bad_downloads() {
-        // wrong checksum
-        let f = fixture("v99.0.0", "99.0.0", false, true);
-        let o = f.update(&[]);
-        assert!(!o.status.success());
-        assert!(s(&o).contains("checksum mismatch"), "{}", s(&o));
-        assert!(f.is_original());
-        assert_eq!(f.litter(), 1);
-        // no checksum asset
-        let f = fixture("v99.0.0", "99.0.0", true, false);
-        let o = f.update(&[]);
-        assert!(!o.status.success());
-        assert!(s(&o).contains("sha256"), "{}", s(&o));
-        assert!(f.is_original());
-        // binary that does not report the expected version
-        let f = fixture("v99.0.0", "1.0.0", true, true);
-        let o = f.update(&[]);
-        assert!(!o.status.success());
-        assert!(s(&o).contains("self-test"), "{}", s(&o));
-        assert!(f.is_original());
-        assert_eq!(f.litter(), 1);
-    }
-
-    #[test]
-    fn missing_release_is_reported() {
-        let port = serve(HashMap::new());
-        let e = Env::new();
-        let o = e
-            .cmd()
-            .env(
-                "NDO4GIT_RELEASES_API",
-                format!("http://127.0.0.1:{port}/api"),
+        fn cmd(&self) -> Command {
+            let mut c = self.e.cmd();
+            c.env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.e.fakebin.path().display()),
             )
-            .arg("update")
+            .env("HOME", self.e.cfg.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &self.gitconfig);
+            c
+        }
+
+        fn run(&self, args: &[&str]) -> Output {
+            self.cmd().args(args).output().unwrap()
+        }
+
+        fn ok(&self, args: &[&str]) -> String {
+            let o = self.run(args);
+            assert!(o.status.success(), "{args:?}: {}", s(&o));
+            String::from_utf8(o.stdout).unwrap()
+        }
+
+        fn manifest_path(&self) -> PathBuf {
+            self.e.cfg.path().join("xdg/ndo4git/manifest.toml")
+        }
+
+        fn write_manifest(&self, text: &str) {
+            let p = self.manifest_path();
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        }
+    }
+
+    const MANIFEST: &str = r#"
+version = 1
+perf = true
+hostkey = "strict"
+keys = ["acme/widget", "git.example.org/team/proj"]
+
+[hosts]
+"git.example.org" = "gitlab"
+
+[aliases]
+"acme/old" = "acme/widget"
+
+[[identity]]
+id = "work"
+name = "Ada"
+email = "ada@acme.example"
+match = ["github.com/acme/*"]
+"#;
+
+    #[test]
+    fn plan_apply_is_idempotent_and_rollback_restores() {
+        let m = M::new();
+        // a first run makes the data directory; `init` mirrors it
+        m.ok(&["init"]);
+        assert!(m.ok(&["plan"]).contains("up to date"));
+        assert_eq!(m.run(&["plan", "--check"]).status.code(), Some(0));
+
+        m.write_manifest(MANIFEST);
+        let plan = m.ok(&["plan"]);
+        assert!(plan.contains("+ key acme/widget on github.com"), "{plan}");
+        assert!(plan.contains("+ host git.example.org (gitlab)"), "{plan}");
+        assert!(plan.contains("alias acme/old -> acme/widget"), "{plan}");
+        assert!(
+            plan.contains("host-key policy accept-new -> strict"),
+            "{plan}"
+        );
+        assert_eq!(m.run(&["plan", "--check"]).status.code(), Some(2));
+        // plan changes nothing
+        assert!(m.ok(&["list"]).contains("no keys") || !m.ok(&["list"]).contains("acme/widget"));
+
+        let out = m.ok(&["apply"]);
+        assert!(out.contains("Add this public key at:"), "{out}");
+        assert!(m.ok(&["list"]).contains("acme/widget"));
+        assert!(m.ok(&["host", "list"]).contains("git.example.org"));
+        let cfg = fs::read_to_string(&m.gitconfig).unwrap();
+        assert!(cfg.contains("main.gitconfig"), "{cfg}");
+
+        // converged
+        assert!(m.ok(&["plan"]).contains("up to date"));
+        assert_eq!(m.run(&["plan", "--check"]).status.code(), Some(0));
+        assert!(m.ok(&["apply"]).contains("nothing to do"));
+
+        m.ok(&["rollback"]);
+        assert!(!m.ok(&["list"]).contains("acme/widget"));
+        assert!(!m.ok(&["host", "list"]).contains("git.example.org"));
+        let cfg = fs::read_to_string(&m.gitconfig).unwrap_or_default();
+        assert!(!cfg.contains("main.gitconfig"), "{cfg}");
+        assert!(!m.run(&["rollback"]).status.success(), "single level");
+        assert_eq!(m.run(&["plan", "--check"]).status.code(), Some(2));
+    }
+
+    impl M {
+        /// Run real git in `dir` with the isolated environment; returns (success, stdout).
+        fn git(&self, dir: &Path, args: &[&str]) -> (bool, String) {
+            let o = Command::new("git")
+                .current_dir(dir)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.e.cfg.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
+                .args(args)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+            )
+        }
+    }
+
+    #[test]
+    fn git_really_applies_the_identity_for_every_url_spelling() {
+        let m = M::new();
+        m.write_manifest(MANIFEST);
+        m.ok(&["apply"]);
+        let repo = tempfile::tempdir().unwrap();
+        assert!(m.git(repo.path(), &["init", "-q"]).0);
+        for url in [
+            "git@github.com:acme/widget.git",
+            "git@github.com:Acme/Widget.git",
+            "git@github.com:acme/other",
+            "https://github.com/acme/widget",
+            "https://user@github.com/acme/widget.git",
+            "ssh://git@github.com/acme/widget.git",
+        ] {
+            let _ = m.git(repo.path(), &["remote", "remove", "origin"]);
+            assert!(m.git(repo.path(), &["remote", "add", "origin", url]).0);
+            let (ok, email) = m.git(repo.path(), &["config", "user.email"]);
+            assert!(ok && email == "ada@acme.example", "{url}: {ok} {email:?}");
+        }
+        for url in [
+            "git@github.com:other/widget.git",
+            "git@gitlab.com:acme/widget.git",
+            "https://example.org/acme/widget",
+        ] {
+            let _ = m.git(repo.path(), &["remote", "remove", "origin"]);
+            assert!(m.git(repo.path(), &["remote", "add", "origin", url]).0);
+            assert!(!m.git(repo.path(), &["config", "user.email"]).0, "{url}");
+        }
+        // after rollback git sees no identity any more
+        m.ok(&["rollback"]);
+        let _ = m.git(repo.path(), &["remote", "remove", "origin"]);
+        m.git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:acme/widget.git"],
+        );
+        assert!(!m.git(repo.path(), &["config", "user.email"]).0);
+    }
+
+    #[test]
+    fn perf_preset_reaches_git() {
+        let m = M::new();
+        m.write_manifest(MANIFEST);
+        m.ok(&["apply"]);
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            m.git(d.path(), &["config", "ssh.variant"]),
+            (true, "ssh".to_owned())
+        );
+        assert_eq!(
+            m.git(d.path(), &["config", "fetch.parallel"]),
+            (true, "0".to_owned())
+        );
+    }
+
+    #[test]
+    fn whoami_reports_match_and_mismatch() {
+        let m = M::new();
+        m.write_manifest(MANIFEST);
+        let o = m.ok(&["whoami", "acme/widget"]);
+        assert!(
+            o.contains("Identity:  work") && o.contains("ada@acme.example"),
+            "{o}"
+        );
+        assert!(m.ok(&["whoami", "other/thing"]).contains("Identity:  none"));
+
+        // inside a repo: mismatch before apply, match after
+        let repo = tempfile::tempdir().unwrap();
+        m.git(repo.path(), &["init", "-q"]);
+        m.git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:acme/widget.git"],
+        );
+        let run = || {
+            m.cmd()
+                .current_dir(repo.path())
+                .arg("whoami")
+                .output()
+                .unwrap()
+        };
+        let o = run();
+        assert_eq!(o.status.code(), Some(1), "{}", s(&o));
+        assert!(String::from_utf8_lossy(&o.stdout).contains("MISMATCH"));
+        m.ok(&["apply"]);
+        let o = run();
+        assert!(o.status.success(), "{}", s(&o));
+    }
+
+    #[test]
+    fn bad_manifests_are_rejected_with_a_clear_error() {
+        let m = M::new();
+        m.write_manifest("version = 1\n[settings]\n\"core.sshCommand\" = \"x\"\n");
+        let o = m.run(&["plan"]);
+        assert!(!o.status.success());
+        assert!(s(&o).contains("not allowed"), "{}", s(&o));
+        m.write_manifest("version = 7\n");
+        assert!(s(&m.run(&["plan"])).contains("not supported"));
+        let _ = fs::remove_file(m.manifest_path());
+        assert!(s(&m.run(&["plan"])).contains("ndo4git init"));
+    }
+
+    #[test]
+    fn apply_removes_identity_files_when_identities_go_away() {
+        let m = M::new();
+        m.write_manifest(MANIFEST);
+        m.ok(&["apply"]);
+        let derived = m.e.cfg.path().join("xdg/ndo4git/derived");
+        assert!(derived.join("id-work.gitconfig").exists());
+        m.write_manifest("version = 1\n");
+        let o = m.ok(&["apply"]);
+        assert!(o.contains("- file derived/id-work.gitconfig"), "{o}");
+        assert!(!derived.join("id-work.gitconfig").exists());
+        assert!(!fs::read_to_string(&m.gitconfig)
+            .unwrap()
+            .contains("main.gitconfig"));
+    }
+}
+
+// ---------------------------------------------------------------- git shim
+
+mod shim {
+    use super::*;
+
+    /// shim dir (symlink `git` -> ndo4git) in front of a dir with a fake "real git".
+    fn setup() -> (TempDir, PathBuf, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let shim = t.path().join("shim");
+        let real = t.path().join("real");
+        fs::create_dir_all(&shim).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(BIN, shim.join("git")).unwrap();
+        fs::write(
+            real.join("git"),
+            "#!/bin/sh\nprintf 'REAL'; for a in \"$@\"; do printf '|%s' \"$a\"; done; echo\nexit \"${REAL_EXIT:-0}\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(real.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+        (t, shim, real)
+    }
+
+    fn run(shim: &Path, real: &Path, args: &[&str]) -> Output {
+        Command::new(shim.join("git"))
+            .env_clear()
+            .env("PATH", format!("{}:{}", shim.display(), real.display()))
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn passes_arguments_and_exit_status_through() {
+        let (_t, shim, real) = setup();
+        let o = run(&shim, &real, &["status", "-s", "with space", "--", "-x"]);
+        assert!(o.status.success());
+        assert_eq!(s_out(&o), "REAL|status|-s|with space|--|-x\n");
+        let o = Command::new(shim.join("git"))
+            .env_clear()
+            .env("PATH", format!("{}:{}", shim.display(), real.display()))
+            .env("REAL_EXIT", "3")
+            .arg("push")
             .output()
             .unwrap();
+        assert_eq!(o.status.code(), Some(3));
+    }
+
+    #[test]
+    fn missing_real_git_is_a_clear_error_not_a_loop() {
+        let (_t, shim, real) = setup();
+        fs::remove_file(real.join("git")).unwrap();
+        let o = run(&shim, &real, &["status"]);
+        let system_git = ["/usr/bin/git", "/bin/git", "/opt/homebrew/bin/git"]
+            .iter()
+            .any(|p| Path::new(p).exists());
+        if system_git {
+            // PATH has no real git, but the well-known locations do: the shim must not break the call
+            assert_ne!(o.status.code(), Some(127), "{}", s(&o));
+        } else {
+            assert_eq!(o.status.code(), Some(127));
+            assert!(s(&o).contains("is git installed"), "{}", s(&o));
+        }
+    }
+
+    fn s_out(o: &Output) -> String {
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    }
+}
+
+// ---------------------------------------------------------------- automation surface
+
+mod automation {
+    use super::*;
+
+    fn json(o: &str) -> serde_json::Value {
+        serde_json::from_str(o).unwrap_or_else(|e| panic!("not JSON ({e}): {o}"))
+    }
+
+    #[test]
+    fn schema_describes_every_public_command_and_exit_codes() {
+        let e = Env::new();
+        let v = json(&e.ok(&["schema"]));
+        assert_eq!(v["name"], "ndo4git");
+        assert!(v["exit_codes"]["2"]
+            .as_str()
+            .unwrap()
+            .contains("plan --check"));
+        let cmds: Vec<&str> = v["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["command"].as_str().unwrap())
+            .collect();
+        for want in [
+            "new",
+            "list",
+            "show",
+            "plan",
+            "apply",
+            "rollback",
+            "whoami",
+            "init",
+            "schema",
+            "host list",
+            "host add",
+            "backup",
+            "restore",
+        ] {
+            assert!(cmds.contains(&want), "{want} missing from {cmds:?}");
+        }
+        // hidden/internal commands are not advertised
+        assert!(!cmds.contains(&"ssh-wrapper") && !cmds.contains(&"uninstall"));
+        let plan = v["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["command"] == "plan")
+            .unwrap();
+        assert_eq!(plan["has_json_output"], true);
+    }
+
+    #[test]
+    fn json_output_everywhere() {
+        let e = Env::new();
+        e.ok(&["new", "acme/widget"]);
+        assert_eq!(
+            json(&e.ok(&["list", "--json"])).as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            json(&e.ok(&["show", "acme/widget", "--json"]))["key"]["repo"],
+            "acme/widget"
+        );
+        let hosts = json(&e.ok(&["host", "list", "--json"]));
+        assert!(hosts
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["host"] == "codeberg.org" && h["forge"] == "forgejo"));
+    }
+
+    #[test]
+    fn plan_apply_rollback_whoami_speak_json() {
+        let e = Env::new();
+        let gitconfig = e.cfg.path().join("g");
+        let mk = |args: &[&str]| {
+            let mut c = e.cmd();
+            c.env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", e.fakebin.path().display()),
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .args(args);
+            c.output().unwrap()
+        };
+        let dir = e.cfg.path().join("xdg/ndo4git");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("manifest.toml"),
+            "version = 1\nkeys = [\"acme/widget\"]\n[[identity]]\nid = \"w\"\nemail = \"a@b.example\"\nmatch = [\"github.com/acme/*\"]\n",
+        )
+        .unwrap();
+        let o = mk(&["plan", "--json", "--check"]);
+        assert_eq!(o.status.code(), Some(2));
+        let plan = json(&String::from_utf8(o.stdout).unwrap());
+        assert!(plan
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["op"] == "key_create"));
+
+        let o = mk(&["apply", "--json"]);
+        assert!(o.status.success(), "{}", s(&o));
+        let v = json(&String::from_utf8(o.stdout).unwrap());
+        assert_eq!(v["created_keys"][0]["repo"], "acme/widget");
+        assert!(v["created_keys"][0]["public_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("ssh-ed25519 "));
+
+        let o = mk(&["whoami", "acme/widget", "--json"]);
+        let v = json(&String::from_utf8(o.stdout).unwrap());
+        assert_eq!(v["identity"], "w");
+        assert_eq!(v["ok"], true);
+
+        let o = mk(&["rollback", "--json"]);
+        let v = json(&String::from_utf8(o.stdout).unwrap());
+        assert!(!v["reverted"].as_array().unwrap().is_empty());
+    }
+}
+
+// ---------------------------------------------------------------- hardening
+
+mod hardening {
+    use super::*;
+
+    struct H {
+        e: Env,
+        gitconfig: PathBuf,
+    }
+
+    impl H {
+        fn new(manifest: &str) -> Self {
+            let e = Env::new();
+            let gitconfig = e.cfg.path().join("global.gitconfig");
+            let dir = e.cfg.path().join("xdg/ndo4git");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("manifest.toml"), manifest).unwrap();
+            Self { e, gitconfig }
+        }
+
+        fn run(&self, args: &[&str]) -> Output {
+            let mut c = self.e.cmd();
+            c.env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.e.fakebin.path().display()),
+            )
+            .env("HOME", self.e.cfg.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
+            .args(args);
+            c.output().unwrap()
+        }
+
+        fn dir(&self) -> PathBuf {
+            self.e.cfg.path().join("xdg/ndo4git")
+        }
+    }
+
+    const M: &str = "version = 1\nkeys = [\"acme/widget\"]\n[[identity]]\nid = \"w\"\nemail = \"a@b.example\"\nmatch = [\"github.com/acme/*\"]\n";
+
+    #[test]
+    fn tampered_journal_is_refused_before_anything_is_touched() {
+        let h = H::new(M);
+        assert!(h.run(&["apply"]).status.success());
+        let j = h.dir().join("last-apply.json");
+        let text = fs::read_to_string(&j).unwrap();
+        let evil = text.replace(
+            h.dir().join("derived/main.gitconfig").to_str().unwrap(),
+            "/tmp/evil.gitconfig",
+        );
+        assert_ne!(text, evil);
+        fs::write(&j, evil).unwrap();
+        let o = h.run(&["rollback"]);
         assert!(!o.status.success());
-        assert!(s(&o).contains("no matching release"), "{}", s(&o));
+        assert!(s(&o).contains("unexpected include path"), "{}", s(&o));
+        // nothing was reverted: the key and the include are still there
+        assert!(String::from_utf8_lossy(&h.run(&["list"]).stdout).contains("acme/widget"));
+        assert!(fs::read_to_string(&h.gitconfig)
+            .unwrap()
+            .contains("main.gitconfig"));
+        // a journal naming a derived file outside the directory is refused too
+        fs::write(&j, text.replace("id-w.gitconfig", "../../x.gitconfig")).unwrap();
+        assert!(!h.run(&["rollback"]).status.success());
+    }
+
+    #[test]
+    fn rollback_keeps_a_key_that_has_been_used() {
+        let h = H::new(M);
+        assert!(h.run(&["apply"]).status.success());
+        // use the key through the wrapper (this stamps last_used_at)
+        let o = h.run(&[
+            "ssh-wrapper",
+            "git@github.com",
+            "git-upload-pack 'acme/widget.git'",
+        ]);
+        assert!(o.status.success(), "{}", s(&o));
+        let o = h.run(&["rollback"]);
+        assert!(o.status.success(), "{}", s(&o));
+        assert!(s(&o).contains("kept key acme/widget"), "{}", s(&o));
+        assert!(String::from_utf8_lossy(&h.run(&["list"]).stdout).contains("acme/widget"));
+        // the rest was reverted
+        assert!(!fs::read_to_string(&h.gitconfig)
+            .unwrap_or_default()
+            .contains("main.gitconfig"));
+    }
+
+    #[test]
+    fn nested_group_and_port_urls_get_the_identity() {
+        let m = "version = 1\n[[identity]]\nid = \"g\"\nemail = \"g@x.example\"\nmatch = [\"gitlab.com/grp/*\"]\n";
+        let h = H::new(m);
+        assert!(h.run(&["apply"]).status.success());
+        let repo = h.e.cfg.path().join("r");
+        for url in [
+            "git@gitlab.com:grp/sub/proj.git",
+            "ssh://git@gitlab.com:2222/grp/sub/proj.git",
+            "https://gitlab.com/grp/proj",
+        ] {
+            let _ = fs::remove_dir_all(&repo);
+            let git = |a: &[&str]| {
+                Command::new("git")
+                    .args(a)
+                    .current_dir(&repo)
+                    .env("GIT_CONFIG_GLOBAL", &h.gitconfig)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .unwrap()
+            };
+            fs::create_dir_all(&repo).unwrap();
+            assert!(git(&["init", "-q"]).status.success());
+            assert!(git(&["remote", "add", "o", url]).status.success());
+            let o = git(&["config", "user.email"]);
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout).trim(),
+                "g@x.example",
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_and_rollback_refuse_root() {
+        if !nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let h = H::new(M);
+        assert!(!h.run(&["apply"]).status.success());
+        assert!(!h.run(&["rollback"]).status.success());
+    }
+
+    #[test]
+    fn concurrent_apply_is_refused() {
+        let h = H::new(M);
+        assert!(h.run(&["plan"]).status.success()); // creates the data directory
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(h.dir().join("apply.lock"))
+            .unwrap();
+        let _held = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        let o = h.run(&["apply"]);
+        assert!(!o.status.success());
+        assert!(s(&o).contains("another `ndo4git apply`"), "{}", s(&o));
+        assert!(!h.run(&["rollback"]).status.success());
+    }
+
+    #[test]
+    fn whoami_merges_identities_like_git_does() {
+        let h = H::new(
+            "version = 1\n[[identity]]\nid = \"base\"\nname = \"Ada\"\nemail = \"ada@home.example\"\nmatch = [\"github.com/*\"]\n[[identity]]\nid = \"work\"\nemail = \"ada@acme.example\"\nmatch = [\"github.com/acme/*\"]\n",
+        );
+        let o = h.run(&["whoami", "acme/x", "--json"]);
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(v["identities"], serde_json::json!(["base", "work"]));
+        let fields = v["fields"].as_array().unwrap();
+        let get = |k: &str| fields.iter().find(|f| f["key"] == k).unwrap()["expected"].clone();
+        assert_eq!(get("user.name"), "Ada");
+        assert_eq!(get("user.email"), "ada@acme.example");
+    }
+
+    #[test]
+    fn mutually_recursive_shims_stop_with_a_clear_error() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d).unwrap();
+            fs::copy(BIN, d.join("git")).unwrap(); // copies, not symlinks: neither is "ours" by name
+        }
+        let o = Command::new(a.join("git"))
+            .env_clear()
+            .env("PATH", format!("{}:{}", a.display(), b.display()))
+            .arg("status")
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(126), "{}", s(&o));
+        assert!(s(&o).contains("calling itself"), "{}", s(&o));
+    }
+
+    #[test]
+    fn shim_still_finds_git_when_path_is_empty() {
+        if !Path::new("/usr/bin/git").exists() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(BIN, t.path().join("git")).unwrap();
+        let o = Command::new(t.path().join("git"))
+            .env_clear()
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", s(&o));
+        assert!(String::from_utf8_lossy(&o.stdout).starts_with("git version"));
     }
 }
